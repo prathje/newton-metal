@@ -298,7 +298,7 @@ class Example:
             self._push_targets_from_gizmos()
             if self.graph:
                 wp.capture_launch(self.graph)
-            elif wp.get_device().is_cuda:
+            elif not wp.get_device().is_cpu:
                 self.capture()
             else:
                 self.simulate()

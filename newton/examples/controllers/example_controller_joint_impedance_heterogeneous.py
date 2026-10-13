@@ -194,7 +194,7 @@ class Example:
         self._input.joint_qd = self.state_0.joint_qd
 
         self._graph = None
-        if self.controller.is_graphable() and self.device.is_cuda:
+        if self.controller.is_graphable() and newton.examples.supports_graph_capture(self.device):
             with wp.ScopedCapture() as capture:
                 self._gpu_step()
             self._graph = capture.graph

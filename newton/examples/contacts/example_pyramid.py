@@ -175,7 +175,7 @@ class Example:
         self.capture()
 
     def capture(self):
-        if wp.get_device().is_cuda and not wp.config.verify_cuda:
+        if newton.examples.supports_graph_capture() and not wp.config.verify_cuda:
             with wp.ScopedCapture() as capture:
                 self.simulate()
             self.graph = capture.graph

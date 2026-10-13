@@ -34,6 +34,7 @@ from newton._src.solvers.kamino._src.utils import logger as msg
 from newton._src.solvers.kamino._src.utils.sim import Simulator
 from newton._src.solvers.kamino._src.utils.viewer import Color3, ViewerConfig
 from newton._src.solvers.kamino.solver_kamino import SolverKamino
+from newton._src.utils.device import is_metal
 from newton._src.viewer import ViewerGL
 
 
@@ -266,7 +267,7 @@ class RigidBodySim:
     ):
         # ----- Device setup -----
         self._device = wp.get_device(device)
-        self._torch_device: str = "cuda" if self._device.is_cuda else "cpu"
+        self._torch_device: str = "mps" if is_metal(self._device) else ("cuda" if self._device.is_cuda else "cpu")
         self._use_cuda_graph = use_cuda_graph
         self._use_torch = use_torch
         self._sim_dt = sim_dt
@@ -1081,7 +1082,7 @@ class RigidBodySim:
 
     @property
     def torch_device(self) -> str:
-        """Torch device string (``"cuda"`` or ``"cpu"``)."""
+        """Torch device string (``"cuda"``, ``"mps"`` or ``"cpu"``)."""
         return self._torch_device
 
     @property

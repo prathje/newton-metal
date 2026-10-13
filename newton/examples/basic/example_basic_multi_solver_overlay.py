@@ -166,7 +166,7 @@ class _SolverLayer:
             self.state_0, self.state_1 = self.state_1, self.state_0
 
     def _capture(self) -> wp.Graph | None:
-        if not wp.get_device().is_cuda:
+        if not newton.examples.supports_graph_capture():
             return None
         try:
             with wp.ScopedCapture() as capture:

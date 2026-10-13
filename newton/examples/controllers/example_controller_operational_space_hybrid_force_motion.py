@@ -355,7 +355,7 @@ class Example:
         self._input.desired_twist_operational.assign(np.zeros((2, 6), dtype=np.float32))
 
         self._graph = None
-        if self.controller.is_graphable() and self.device.is_cuda:
+        if self.controller.is_graphable() and newton.examples.supports_graph_capture(self.device):
             with wp.ScopedCapture() as capture:
                 self._gpu_step()
             self._graph = capture.graph

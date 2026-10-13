@@ -130,7 +130,7 @@ class Example:
 
     def capture(self):
         self.graph = None
-        if self.device.is_cuda and not wp.config.verify_cuda:
+        if newton.examples.supports_graph_capture(self.device) and not wp.config.verify_cuda:
             with wp.ScopedCapture() as capture:
                 self.simulate()
             self.graph = capture.graph
@@ -169,9 +169,9 @@ class Example:
             "all bodies are above the ground",
             lambda q, qd: q[2] > -0.006,
         )
-        # Only check velocities on CUDA where we run 500 frames (enough time to settle)
+        # Only check velocities on GPUs where we run 500 frames (enough time to settle)
         # On CPU we only run 10 frames and the robot is still falling (~0.65 m/s)
-        if self.device.is_cuda:
+        if not self.device.is_cpu:
             newton.examples.test_body_state(
                 self.model,
                 self.state_0,

@@ -328,7 +328,7 @@ class Example:
             self.state_0, self.state_1 = self.state_1, self.state_0
 
     def capture(self) -> None:
-        if self.solver.device.is_cuda:
+        if newton.examples.supports_graph_capture(self.solver.device):
             with wp.ScopedCapture() as capture:
                 self._simulate_substeps()
             self.graph = capture.graph

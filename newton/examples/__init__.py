@@ -22,6 +22,22 @@ from newton.tests.unittest_utils import find_nan_members
 _DEPRECATED_WARP_CONFIG_KEYS = {"quiet", "verbose"}
 
 
+def supports_graph_capture(device: wp.DeviceLike = None) -> bool:
+    """Return whether examples should capture their simulation step on ``device``.
+
+    True for CUDA devices and for Metal devices of Warp's experimental Metal
+    backend, and False for the CPU. Examples whose step relies on conditional
+    graph nodes (:func:`warp.capture_while` / :func:`warp.capture_if`) still
+    require CUDA, since Metal graphs cannot record them.
+
+    Args:
+        device: The Warp device to query. ``None`` uses the current device.
+    """
+    from newton._src.utils.device import supports_graph_capture as _supports_graph_capture  # noqa: PLC0415
+
+    return _supports_graph_capture(device)
+
+
 def get_source_directory() -> str:
     return os.path.realpath(os.path.dirname(__file__))
 
@@ -911,6 +927,9 @@ def init(parser=None):
 
     # Set device if specified
     if args.device:
+        if args.device.split(":")[0] in ("metal", "mps") and hasattr(wp.config, "enable_metal"):
+            # Warp's experimental Metal backend is opt-in and must be enabled before wp.init().
+            wp.config.enable_metal = True
         wp.set_device(args.device)
 
     # Benchmark mode forces null viewer and raises process/thread priority
@@ -1029,6 +1048,7 @@ __all__ = [
     "get_examples",
     "init",
     "run",
+    "supports_graph_capture",
     "test_body_state",
     "test_particle_state",
 ]
