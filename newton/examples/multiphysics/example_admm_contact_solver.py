@@ -164,7 +164,7 @@ class Example:
         self.capture()
 
     def capture(self):
-        if not self.model.device.is_cuda:
+        if not newton.examples.supports_graph_capture(self.model.device):
             self.graph = None
             return
 

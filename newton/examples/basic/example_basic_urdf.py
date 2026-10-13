@@ -134,7 +134,7 @@ class Example:
         self.capture()
 
     def capture(self):
-        if (wp.get_device().is_cuda or self.solver_type != "kamino") and not wp.config.verify_cuda:
+        if (newton.examples.supports_graph_capture() or self.solver_type != "kamino") and not wp.config.verify_cuda:
             with wp.ScopedCapture() as capture:
                 self.simulate()
             self.graph = capture.graph

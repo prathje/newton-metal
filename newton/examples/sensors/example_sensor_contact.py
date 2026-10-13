@@ -141,7 +141,7 @@ class Example:
 
         # Kamino's solver caches are reset periodically, which is not compatible
         # with replaying a graph captured before the reset.
-        if not wp.get_device().is_cuda or self.solver_type == "kamino":
+        if not newton.examples.supports_graph_capture() or self.solver_type == "kamino":
             return
 
         with wp.ScopedCapture() as capture:

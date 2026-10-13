@@ -396,7 +396,7 @@ if __name__ == "__main__":
     msg.info(f"device: {device}")
 
     # Convert warp device to torch device string for checkpoint loading
-    torch_device = "cuda" if device.is_cuda else "cpu"
+    torch_device = "mps" if getattr(device, "is_metal", False) else ("cuda" if device.is_cuda else "cpu")
 
     # Load trained policy
     POLICY_PATH = os.path.join(_ASSETS_DIR, "bipedal", "model.pt")

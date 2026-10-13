@@ -129,7 +129,7 @@ class Example:
         self.capture()
 
     def capture(self):
-        if wp.get_device().is_cuda:
+        if newton.examples.supports_graph_capture():
             with wp.ScopedCapture() as capture:
                 self.simulate()
             self.graph = capture.graph
