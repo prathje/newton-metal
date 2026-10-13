@@ -41,6 +41,7 @@ from ...sim.contacts import GENERATION_SENTINEL as _GENERATION_SENTINEL
 from ...sim.graph_coloring import color_graph, plot_graph
 from ...utils import topological_sort
 from ...utils.benchmark import event_scope
+from ...utils.device import is_capturing
 from ...utils.import_utils import string_to_warp
 from ..coupled.interface import CouplingEndpointKind, CouplingInterface
 from ..solver import SolverBase
@@ -5853,7 +5854,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
 
         # Host validation cannot be captured. Eager notifications still reject
         # resizing; callers must preserve mesh scales throughout graph replay.
-        if self.model.device.is_capturing:
+        if is_capturing(self.model.device):
             return
 
         current = self.model.shape_scale.numpy()[self._compiled_mesh_shape_indices]
@@ -10422,7 +10423,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             joint_limit_solref_mode is not None
             and joint_limit_solref is not None
             and not self._raw_solreflimit_validated
-            and not self.model.device.is_capturing
+            and not is_capturing(self.model.device)
         ):
             mode_np = joint_limit_solref_mode if self.use_mujoco_cpu else joint_limit_solref_mode.numpy()
             raw_np = joint_limit_solref.numpy()

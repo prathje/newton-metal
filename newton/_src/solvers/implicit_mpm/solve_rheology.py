@@ -17,6 +17,7 @@ import warp.sparse as sp
 from warp.fem.linalg import array_axpy
 from warp.optim.linear import LinearOperator, cg, cr, gmres
 
+from ...utils.device import supports_cooperative_blocks
 from .contact_solver_kernels import (
     ColoredContacts,
     apply_nodal_impulse_warmstart,
@@ -1423,7 +1424,8 @@ class _LinearSolver:
 
     def _scale_batched_system(self, tolerance_scales: wp.array[float], inverse: bool):
         environment_offsets = self.rheology.strain_environment_offsets
-        block_dim = 256 if self.momentum.velocity.device.is_cuda else 1
+        # The kernel strides lanes by wp.block_dim(), which CPU and Metal report as 1.
+        block_dim = 256 if supports_cooperative_blocks(self.momentum.velocity.device) else 1
         wp.launch(
             _scale_linear_system_by_environment,
             dim=(tolerance_scales.shape[0], block_dim),
