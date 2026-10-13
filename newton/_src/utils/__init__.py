@@ -30,8 +30,9 @@ def is_graph_capture_allocation_enabled(device) -> bool:
     for CPU the concept does not apply -- plain host allocation is always
     safe during CPU graph capture -- so this always returns ``True`` for CPU
     devices. Metal devices have no memory pool and report ``False``, so
-    callers keep their non-allocating capture path there. Solvers that grow internal buffers on demand should call this
-    before raising a "cannot allocate during capture" error.
+    callers keep their non-allocating capture path there. Solvers that grow
+    internal buffers on demand should call this before raising a "cannot
+    allocate during capture" error.
 
     Args:
         device: A Warp device or device identifier.
