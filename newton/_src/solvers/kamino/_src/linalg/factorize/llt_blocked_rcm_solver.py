@@ -30,7 +30,7 @@ from typing import Any
 import warp as wp
 
 from ......core.types import override
-from ......utils.device import is_capturing
+from ......utils.device import active_capture_key, is_capturing
 from ...core.types import FloatType, to_warp_int32_array
 from ..core import DenseLinearOperatorData, DenseSquareMultiLinearInfo
 from ..linear import DirectSolver
@@ -225,7 +225,7 @@ class LLTBlockedRCMSolver(DirectSolver[wp.float32, wp.int32]):
         self._reorder_attached_to: wp.array[dtype] | None = None
         self._permutation_initialized = False
         self._permutation_initialized_during_capture = False
-        self._permutation_capture_id: int | None = None
+        self._permutation_capture_id: object | None = None
         self._structural_pairs: tuple[wp.array, wp.array, wp.array] | None = None
         self._structural_pattern: wp.array[wp.int32] | None = None
         self._structural_ready: wp.array[wp.int32] | None = None
@@ -530,11 +530,9 @@ class LLTBlockedRCMSolver(DirectSolver[wp.float32, wp.int32]):
         info = self._operator.info
         num_blocks = info.num_blocks
         capturing = is_capturing(self._device)
-        capture_id = None
-        if capturing and self._device.is_cuda:
-            capture = self._device.captures.get(self._device.stream)
-            if capture is not None:
-                capture_id = capture.capture_id
+        # CUDA capture id, or the Metal graph being recorded, so a re-capture
+        # is distinguished from the capture that initialized the permutation.
+        capture_id = active_capture_key(self._device) if capturing else None
 
         # Recording RCM launches mutates host cache state before a captured
         # graph executes. Validate that one-time transition against the device
