@@ -6,6 +6,8 @@ from typing import Any
 
 import warp as wp
 
+from ...utils.device import is_metal
+
 
 @wp.struct
 class NonZeroEntry:
@@ -210,6 +212,41 @@ def generate_test_data_kernel(
         A_non_diag.nz_ell[1, tid].column_index = tid - 1
 
 
+@wp.kernel
+def array_inner_index_kernel(
+    a: wp.array[wp.vec3],
+    b: wp.array[wp.vec3],
+    index: int,
+    out: wp.array[float],
+):
+    tid = wp.tid()
+    wp.atomic_add(out, index, wp.dot(a[tid], b[tid]))
+
+
+@wp.kernel
+def zero_index_kernel(index: int, out: wp.array[float]):
+    out[index] = 0.0
+
+
+def array_inner_at(
+    a: wp.array[wp.vec3],
+    b: wp.array[wp.vec3],
+    out: wp.array[float],
+    index: int,
+):
+    """Write ``dot(a, b)`` to ``out[index]``.
+
+    CPU and CUDA call Warp's native reduction. Metal has no device-side
+    native reduction, and the host fallback cannot be recorded in a graph,
+    so it accumulates with a kernel instead.
+    """
+    if is_metal(a.device):
+        wp.launch(zero_index_kernel, dim=1, inputs=[index], outputs=[out], device=a.device)
+        wp.launch(array_inner_index_kernel, dim=len(a), inputs=[a, b, index], outputs=[out], device=a.device)
+    else:
+        array_inner(a, b, out.ptr + index * out.strides[0])
+
+
 def array_inner(
     a: wp.array[wp.vec3],
     b: wp.array[wp.vec3],
@@ -217,6 +254,8 @@ def array_inner(
 ):
     from warp._src.context import runtime  # noqa: PLC0415
 
+    if is_metal(a.device):
+        raise RuntimeError("array_inner() takes a raw pointer and does not support Metal; use array_inner_at()")
     if a.device.is_cpu:
         func = runtime.core.wp_array_inner_float_host
     else:
@@ -291,7 +330,7 @@ class PcgSolver:
         wp.launch(array_mul_kernel, dim=self.dim, inputs=[inv_M, self.r], outputs=[self.z], device=self.device)
 
     def step3_update_rTz(self, iter: int):
-        array_inner(self.r, self.z, self.rTz.ptr + iter * self.rTz.strides[0])
+        array_inner_at(self.r, self.z, self.rTz, iter)
 
     def step4_update_p(self, iter: int):
         wp.launch(
@@ -326,7 +365,7 @@ class PcgSolver:
             )
 
     def step6_update_pTAp(self, iter: int):
-        array_inner(self.p, self.Ap, self.pTAp.ptr + iter * self.pTAp.strides[0])
+        array_inner_at(self.p, self.Ap, self.pTAp, iter)
 
     def step7_update_x_r(self, x: wp.array[wp.vec3], iter: int):
         wp.launch(
