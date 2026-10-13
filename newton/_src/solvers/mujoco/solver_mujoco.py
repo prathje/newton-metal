@@ -41,7 +41,7 @@ from ...sim.contacts import GENERATION_SENTINEL as _GENERATION_SENTINEL
 from ...sim.graph_coloring import color_graph, plot_graph
 from ...utils import topological_sort
 from ...utils.benchmark import event_scope
-from ...utils.device import is_capturing
+from ...utils.device import is_capturing, is_metal
 from ...utils.import_utils import string_to_warp
 from ..coupled.interface import CouplingEndpointKind, CouplingInterface
 from ..solver import SolverBase
@@ -8852,6 +8852,10 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                         np.arange(nworld, dtype=np.int32)[:, None] * actuators_per_world + source_rows
                     )
                     self._compiled_actuator_gears = self.mj_model.actuator_gear[fixed].astype(np.float32)
+            if is_metal(model.device):
+                # Metal graphs cannot record conditional nodes. Run the fixed
+                # iteration loops instead so steps can still be captured.
+                self.mjw_model.opt.graph_conditional = False
 
             # patch mjw_model with mesh_pos if it doesn't have it
             if not hasattr(self.mjw_model, "mesh_pos"):
