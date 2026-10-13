@@ -23,6 +23,7 @@ import newton
 from ...core.types import override
 from ...geometry.particle_surface import ParticleSurface
 from ...sim import ModelFlags, StateFlags
+from ...utils.device import is_capturing, supports_conditional_graphs
 from ..coupled.interface import CouplingInterface
 from ..solver import SolverBase
 from .implicit_mpm_model import ImplicitMPMModel
@@ -1508,7 +1509,7 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
             )
         self._stress_warmstart = "" if warmstart_mode == "none" else warmstart_mode
 
-        self._use_cuda_graph = self.model.device.is_cuda and wp.is_conditional_graph_supported()
+        self._use_cuda_graph = supports_conditional_graphs(self.model.device)
 
         self._timers_use_nvtx = False
 
@@ -1618,7 +1619,7 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
         """
         if self._grid_status is None:
             return
-        if self.model.device.is_capturing:
+        if is_capturing(self.model.device):
             raise RuntimeError("Cannot inspect sparse grid rebuild status during graph capture")
 
         status = int(self._grid_status.numpy()[0])
@@ -1637,7 +1638,7 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
         Raises:
             RuntimeError: If called while the solver device is capturing a graph.
         """
-        if self.model.device.is_capturing:
+        if is_capturing(self.model.device):
             raise RuntimeError("Cannot clear sparse grid rebuild status during graph capture")
         if self._grid_status is not None:
             self._grid_status.zero_()
