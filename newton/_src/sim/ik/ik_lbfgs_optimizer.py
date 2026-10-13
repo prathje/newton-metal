@@ -12,6 +12,7 @@ from typing import Any, ClassVar
 import numpy as np
 import warp as wp
 
+from ...utils.device import supports_streams
 from ..enums import JointType
 from ..model import Model
 from .ik_common import IKJacobianType, compute_costs, eval_fk_batched, fk_accum
@@ -739,7 +740,7 @@ class IKOptimizerLBFGS:
         self.objective_streams = []
         self.sync_events = []
 
-        if self.device.is_cuda:
+        if supports_streams(self.device):
             for _ in range(len(self.objectives)):
                 stream = wp.Stream(self.device)
                 event = wp.Event(self.device)
@@ -751,7 +752,7 @@ class IKOptimizerLBFGS:
 
     def _parallel_for_objectives(self, fn: Callable[..., None], *extra: Any) -> None:
         """Run <fn(obj, offset, *extra)> across objectives on parallel CUDA streams."""
-        if self.device.is_cuda:
+        if supports_streams(self.device):
             main = wp.get_stream(self.device)
             init_evt = main.record_event()
             for obj, offset, obj_stream, sync_event in zip(

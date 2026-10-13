@@ -12,6 +12,7 @@ import warp as wp
 from ..utils import (
     _looks_like_torch_checkpoint,
     _parse_metadata_scale,
+    _torch_device_name,
     load_checkpoint,
     load_metadata,
 )
@@ -248,7 +249,7 @@ class DriveNeuralLSTM(DriveBase):
         if self._is_torch_checkpoint:
             import torch
 
-            self._torch_device = torch.device(f"cuda:{device.ordinal}" if device.is_cuda else "cpu")
+            self._torch_device = torch.device(_torch_device_name(device))
             self.network = self.network.to(self._torch_device)
             return
 

@@ -11,6 +11,7 @@ from typing import Any
 
 import warp as wp
 
+from ..utils.device import is_metal
 from ..utils.onnx import load_onnx_runtime
 
 _METADATA_FILE = "metadata.json"
@@ -26,6 +27,14 @@ def _require_onnx():
             "Install it with `pip install newton[onnx]`."
         ) from exc
     return onnx
+
+
+def _torch_device_name(device: wp.Device) -> str:
+    """Return the Torch device that shares memory with Warp ``device``."""
+    if is_metal(device):
+        # Torch calls Apple's GPU "mps".
+        return "mps"
+    return f"cuda:{device.ordinal}" if device.is_cuda else "cpu"
 
 
 def _looks_like_torch_checkpoint(path: str) -> bool:

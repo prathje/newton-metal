@@ -32,6 +32,7 @@ from ...sim import (
 from ...sim.collide import _count_soft_particle_rigid_contact_pairs
 from ...sim.joint_mimic import has_supported_joint_mimics
 from ...utils import is_graph_capture_allocation_enabled
+from ...utils.device import is_capturing, supports_cooperative_blocks
 from ...utils.mesh import build_vertex_adjacency_with_warp
 from ..coupled.interface import CouplingInterface
 from ..solver import SolverBase
@@ -117,6 +118,7 @@ def _particle_contact_scatter_worker_count(soft_contact_max: int, particle_count
     is larger, but never more than the contact capacity. Each worker strides over the active contact
     prefix, so the launch size is fixed for CUDA-graph capture while the work follows the active count.
     """
+    # Metal reports no SM count; size its grid like the CPU (one per particle).
     sm_count = device.sm_count if device.is_cuda else 1
     return max(1, min(soft_contact_max, max(2 * 256 * sm_count, particle_count)))
 
@@ -1071,10 +1073,12 @@ class SolverVBD(SolverBase, CouplingInterface):
         self.particle_q_rest = model.particle_q
 
         # Tile solve settings
-        if model.device.is_cpu and particle_enable_tile_solve and wp.config.log_level <= wp.LOG_DEBUG:
+        # The tiled solve needs cooperative tile blocks; CPU and Metal run tiles serially.
+        supports_tile_solve = supports_cooperative_blocks(model.device)
+        if not supports_tile_solve and particle_enable_tile_solve and wp.config.log_level <= wp.LOG_DEBUG:
             print("Info: Tiled solve requires model.device='cuda'. Tiled solve is disabled.")
 
-        self.use_particle_tile_solve = particle_enable_tile_solve and model.device.is_cuda
+        self.use_particle_tile_solve = particle_enable_tile_solve and supports_tile_solve
         # One tiled elasticity kernel, specialized at code generation from static model data.
         # Element materials are static solver inputs; rebuild the solver after changing triangle
         # or edge stiffness so the specialization is recomputed.
@@ -1855,7 +1859,7 @@ class SolverVBD(SolverBase, CouplingInterface):
         return buffer_id
 
     def _raise_if_capturing_resize(self, name: str, current: int, required: int) -> None:
-        if self.device.is_capturing and not is_graph_capture_allocation_enabled(self.device):
+        if is_capturing(self.device) and not is_graph_capture_allocation_enabled(self.device):
             raise RuntimeError(
                 f"SolverVBD {name} buffer needs to grow from {current} to {required} "
                 "during graph capture, but allocation during capture is not enabled on this device. "
@@ -3639,7 +3643,7 @@ class SolverVBD(SolverBase, CouplingInterface):
         # equivalent to `rigid_contact_history=False`. So this guard fires
         # unconditionally when capturing, regardless of the device's
         # allocation-during-capture support.
-        if self.device.is_capturing and self._integrates_rigid_bodies and self.rigid_contact_history:
+        if is_capturing(self.device) and self._integrates_rigid_bodies and self.rigid_contact_history:
             history_capacity = 0 if self._prev_contact_lambda is None else self._prev_contact_lambda.shape[0]
             if history_capacity < rigid_capacity:
                 raise RuntimeError(

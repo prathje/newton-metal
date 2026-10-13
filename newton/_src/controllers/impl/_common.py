@@ -30,6 +30,7 @@ import warp as wp
 
 from ...core.types import Devicelike
 from ...math import velocity_at_point
+from ...utils.device import is_gpu
 
 # Cholesky pivots are clamped above this, scaled by the pivot's own
 # magnitude, so float32 cancellation noise on a near-singular matrix can't
@@ -320,7 +321,7 @@ def _solve_cholesky_block_kernel(
 class _SPDInverse:
     """Own kernels and optional scratch for repeated batched SPD inversions.
 
-    CUDA matrices of size at most 10 use a single launch. Larger matrices factor once per
+    GPU (CUDA or Metal) matrices of size at most 10 use a single launch. Larger matrices factor once per
     block so a few high-DOF robots do not impose a large local-memory frame on
     every column thread. CPU inversions factor once and solve every column on
     one thread per block in the same launch, avoiding redundant factorization
@@ -330,10 +331,14 @@ class _SPDInverse:
     def __init__(self, block_count: int, max_dim: int, device: wp.context.Device):
         self._device = device
         self._block_count = block_count
-        self._column_count = max_dim if device.is_cuda else 1
-        self._factor_once = device.is_cuda and max_dim > 10
+        # Columns are independent threads of a plain launch, so any GPU solves
+        # them in parallel. Deciding all three from one flag keeps Metal from
+        # launching one column without the serial-column kernel.
+        parallel_columns = is_gpu(device)
+        self._column_count = max_dim if parallel_columns else 1
+        self._factor_once = parallel_columns and max_dim > 10
         self._kernel = _make_invert_spd_block_kernel(
-            max_dim, factor_only=self._factor_once, serial_columns=device.is_cpu
+            max_dim, factor_only=self._factor_once, serial_columns=not parallel_columns
         )
         self._factor = (
             wp.empty((block_count, max_dim, max_dim), dtype=float, device=device) if self._factor_once else None
