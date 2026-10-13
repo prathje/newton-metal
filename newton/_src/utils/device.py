@@ -21,6 +21,7 @@ from __future__ import annotations
 import warp as wp
 
 __all__ = [
+    "active_capture_key",
     "check_conditional_capture",
     "is_capturing",
     "is_gpu",
@@ -109,6 +110,26 @@ def is_capturing(device: wp.DeviceLike = None) -> bool:
         # Private Warp state; drop once Metal reports Device.is_capturing.
         return getattr(wp_context.runtime, "_metal_capture_graph", None) is not None
     return False
+
+
+def active_capture_key(device: wp.DeviceLike = None) -> object | None:
+    """Return a key identifying the graph capture active on ``device``.
+
+    CUDA returns the stream capture id. Metal returns the graph being
+    recorded, which is a distinct object for every capture. Returns ``None``
+    when no capture is active or the device has no capture identity.
+    """
+    device = wp.get_device(device)
+    if device.is_cuda:
+        if not device.is_capturing:
+            return None
+        capture = device.captures.get(device.stream)
+        return None if capture is None else capture.capture_id
+    if is_metal(device):
+        from warp._src import context as wp_context  # noqa: PLC0415
+
+        return getattr(wp_context.runtime, "_metal_capture_graph", None)
+    return None
 
 
 def check_conditional_capture(device: wp.DeviceLike, feature: str) -> None:
