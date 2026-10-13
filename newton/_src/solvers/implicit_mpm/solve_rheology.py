@@ -16,7 +16,7 @@ import warp.sparse as sp
 from warp.fem.linalg import array_axpy
 from warp.optim.linear import LinearOperator, cg, cr, gmres
 
-from ...utils.device import supports_cooperative_blocks
+from ...utils.device import is_capturing, supports_cooperative_blocks
 from .contact_solver_kernels import (
     apply_nodal_impulse_warmstart,
     apply_subgrid_impulse,
@@ -1571,7 +1571,7 @@ class _LinearSolver:
         # for the verbose report, and never while an outer capture is recording:
         # a device-to-host copy there serializes the capturing stream (CUDA
         # error 906). Batched solves report the largest residual.
-        if verbose and not (use_graph and self.momentum.velocity.device.is_capturing):
+        if verbose and not (use_graph and is_capturing(self.momentum.velocity.device)):
             if use_graph:
                 end_iter = end_iter.numpy()[0]
             residual, _ = _linear_solver_result_norms(residual, atol, use_graph)

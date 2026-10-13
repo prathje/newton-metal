@@ -23,7 +23,7 @@ import newton
 from ...core.types import override
 from ...geometry.particle_surface import ParticleSurface
 from ...sim import ModelFlags, StateFlags
-from ...utils.device import is_capturing, supports_conditional_graphs
+from ...utils.device import is_capturing, is_metal, supports_conditional_graphs
 from ..coupled.interface import CouplingInterface
 from ..solver import SolverBase
 from .implicit_mpm_model import ImplicitMPMModel
@@ -1931,6 +1931,12 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
         """
         self.validate_observables(observables, contacts)
         model = self.model
+        if is_metal(model.device) and is_capturing(model.device):
+            raise RuntimeError(
+                "SolverImplicitMPM.step() cannot be graph-captured on Metal: without conditional graph "
+                "nodes its iterative solves check convergence on the host. Call step() outside graph "
+                "capture on Metal devices."
+            )
 
         with wp.ScopedDevice(model.device):
             pic = self._particles_to_cells(state_in.particle_q)
