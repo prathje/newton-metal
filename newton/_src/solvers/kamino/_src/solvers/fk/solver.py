@@ -15,6 +15,7 @@ import numpy as np
 import warp as wp
 
 from ......sim import ModelFlags
+from ......utils.device import check_conditional_capture, is_metal
 from ....config import ForwardKinematicsSolverConfig
 from ...core.joints import JointActuationType, JointDoFType
 from ...core.model import ModelKamino
@@ -2407,6 +2408,8 @@ class ForwardKinematicsSolver:
         Raises:
             ValueError: If ``body_u`` is provided without ``actuator_u``.
         """
+        check_conditional_capture(self.device, "ForwardKinematicsSolver.run_fk_solve")
+
         # Check that actuator_u are provided if we need to solve for body_u
         if body_u is not None and actuator_u is None:
             raise ValueError(
@@ -2561,8 +2564,9 @@ class ForwardKinematicsSolver:
                 "Base pose/velocity updates for forward kinematics will have no effect for those worlds."
             )
 
-        # Run solve (with or without graph)
-        if use_graph:
+        # Run solve (with or without graph). The solve loops with
+        # wp.capture_while, which Metal graphs cannot record.
+        if use_graph and not is_metal(self.device):
             if self.graph is None:
                 wp.capture_begin(self.device)
                 self.run_fk_solve(actuator_q, body_q, base_q, actuator_u, base_u, body_u, world_mask)
