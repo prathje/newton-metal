@@ -49,6 +49,7 @@ from ..sim.contacts import GENERATION_SENTINEL, Contacts
 from ..sim.model import Model
 from ..sim.shape_contact_pairs import _shape_contact_pair_count_for_mask, _shape_contact_pair_counts
 from ..sim.state import State
+from ..utils.device import supports_streams
 
 if TYPE_CHECKING:
     from ..solvers.coupled.model_view import ModelView
@@ -2055,7 +2056,7 @@ class CollisionPipeline:
                 else _SPLIT_GJK_MPR_FULL_PAIR_COUNT_THRESHOLD
             )
             split_gjk_mpr = (
-                device.is_cuda
+                supports_streams(device)
                 and has_generic_convex_pairs
                 and generic_convex_pair_work_estimate >= split_pair_count_threshold
             )

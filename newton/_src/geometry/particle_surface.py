@@ -30,6 +30,7 @@ from typing import Literal, NamedTuple
 import numpy as np
 import warp as wp
 
+from ..utils.device import is_gpu, supports_cooperative_blocks
 from . import particle_surface_kernels as kernels
 from . import particle_surface_sparse_kernels as sparse_kernels
 from .hashtable import HashTable
@@ -96,7 +97,7 @@ class _ParticleSurfaceWorkspaceBase:
         sentinel_distance: float,
     ) -> None:
         if positions.shape[0] > 0:
-            tile_size = kernels._AABB_TILE_SIZE if self.device.is_cuda else 1
+            tile_size = kernels._AABB_TILE_SIZE if supports_cooperative_blocks(self.device) else 1
             kernel = kernels.compute_particle_bounds_worlds if use_worlds != 0 else kernels.compute_particle_bounds
             inputs = [positions, flags, use_flags]
             if use_worlds != 0:
@@ -349,7 +350,7 @@ class _ParticleSurfaceSparseWorkspace(_ParticleSurfaceWorkspaceBase):
     ) -> None:
         wp.launch(kernels.reset_bounds, dim=self.world_count, inputs=[self.lower, self.upper], device=self.device)
         if positions.shape[0] > 0:
-            tile_size = kernels._AABB_TILE_SIZE if self.device.is_cuda else 1
+            tile_size = kernels._AABB_TILE_SIZE if supports_cooperative_blocks(self.device) else 1
             kernel = kernels.compute_kernel_bounds_worlds if use_worlds != 0 else kernels.compute_kernel_bounds
             inputs = [positions, radii, flags, use_flags]
             if use_worlds != 0:
@@ -504,7 +505,7 @@ class _ParticleSurfaceSparseWorkspace(_ParticleSurfaceWorkspaceBase):
         self.topology_occupancy.zero_()
         self.topology_voxel_mask.zero_()
         self.topology_voxel_count.zero_()
-        lane_count = 64 if self.device.is_cuda else 1
+        lane_count = 64 if is_gpu(self.device) else 1
         if positions.shape[0] > 0:
             wp.launch(
                 sparse_kernels.mark_particle_support_voxels,
@@ -595,7 +596,7 @@ class _ParticleSurfaceSparseWorkspace(_ParticleSurfaceWorkspaceBase):
             device=self.device,
         )
 
-        candidate_lane_count = 16 if self.device.is_cuda else 1
+        candidate_lane_count = 16 if is_gpu(self.device) else 1
         if positions.shape[0] > 0:
             wp.launch(
                 sparse_kernels.insert_particle_candidate_leaves,
@@ -626,7 +627,7 @@ class _ParticleSurfaceSparseWorkspace(_ParticleSurfaceWorkspaceBase):
                 device=self.device,
             )
 
-            support_lane_count = 64 if self.device.is_cuda else 1
+            support_lane_count = 64 if is_gpu(self.device) else 1
             wp.launch(
                 sparse_kernels.mark_particle_support_voxels_hash,
                 dim=(positions.shape[0], support_lane_count),
@@ -872,7 +873,8 @@ class _ParticleSurfaceSparseWorkspace(_ParticleSurfaceWorkspaceBase):
                     device=self.device,
                 )
             else:
-                if self.device.is_cuda:
+                # Lane-parallel splatting is a plain launch, so any GPU can use it.
+                if is_gpu(self.device):
                     if anisotropic:
                         lane_count = sparse_kernels._DENSITY_SPLAT_LANES_ANISOTROPIC
                         block_dim = sparse_kernels._DENSITY_SPLAT_BLOCK_DIM_ANISOTROPIC

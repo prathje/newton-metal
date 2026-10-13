@@ -14,6 +14,7 @@ import warp as wp
 
 from ..core.types import Vec3
 from ..exceptions import NewtonWarning
+from ..utils.device import supports_cooperative_blocks
 from .inertia import compute_inertia_mesh
 from .types import (
     GeoType,
@@ -1006,15 +1007,17 @@ def get_total_kernel(
 
 # Device-count-aware scan geometry. Each block handles chunks of
 # ``block_dim * SCAN_ITEMS_PER_THREAD`` consecutive counts; ``wp.launch_tiled``
-# clamps ``block_dim`` to one on CPU, so the chunk size is derived from
-# ``wp.block_dim()`` inside the kernels.
+# clamps ``block_dim`` to one on CPU (and Metal runs tile kernels serially), so
+# the chunk size is derived from ``wp.block_dim()`` inside the kernels. A
+# smaller host-side chunk only oversizes the scratch buffer, so size for one
+# lane wherever blocks are not known to be cooperative.
 SCAN_BLOCK_DIM = 256
 SCAN_ITEMS_PER_THREAD = 8
 
 
 def _scan_chunk_size(device) -> int:
     """Return the number of counts each scan chunk covers on ``device``."""
-    block_dim = 1 if wp.get_device(device).is_cpu else SCAN_BLOCK_DIM
+    block_dim = SCAN_BLOCK_DIM if supports_cooperative_blocks(device) else 1
     return block_dim * SCAN_ITEMS_PER_THREAD
 
 
