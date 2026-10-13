@@ -190,7 +190,7 @@ class Example:
     def capture(self):
         self.graph = None
         # SolverStyle3D makes host calls (PCG dot products, BVH refit) that CPU graph capture cannot record
-        if wp.get_device().is_cpu:
+        if not newton.examples.supports_graph_capture():
             return
         with wp.ScopedCapture() as cap:
             self.simulate()
@@ -298,7 +298,7 @@ class Example:
             self._push_targets_from_gizmos()
             if self.graph:
                 wp.capture_launch(self.graph)
-            elif not wp.get_device().is_cpu:
+            elif newton.examples.supports_graph_capture():
                 self.capture()
             else:
                 self.simulate()
