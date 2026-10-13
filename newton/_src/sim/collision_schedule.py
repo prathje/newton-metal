@@ -12,6 +12,7 @@ import numpy as np
 import warp as wp
 
 from ..geometry.flags import ShapeFlags
+from ..utils.device import check_conditional_capture
 from .collide import CollisionPipeline
 from .state import State
 
@@ -162,7 +163,9 @@ class CollisionSubstepScheduler:
 
     :meth:`step` works both directly and during CUDA graph capture. When an
     outer capture is active, the complete fixed schedule is recorded inline.
-    CUDA graph conditional nodes require CUDA 12.4 or newer.
+    CUDA graph conditional nodes require CUDA 12.4 or newer. Metal graphs
+    cannot record conditional nodes, so on Metal call :meth:`step` outside
+    graph capture.
 
     The two states are used as ping-pong buffers. ``substeps`` must be even so
     every frame begins and ends in ``states[0]``. Callbacks must be capture-safe
@@ -321,6 +324,7 @@ class CollisionSubstepScheduler:
     def step(self) -> None:
         """Execute or record one complete fixed-substep frame."""
         model = self._model
+        check_conditional_capture(model.device, "CollisionSubstepScheduler.step")
         for substep_index in range(self._substeps):
             state_in = substep_index % 2
             state = self._states[state_in]

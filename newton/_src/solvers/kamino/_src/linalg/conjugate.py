@@ -14,6 +14,7 @@ from typing import Any, Generic
 
 import warp as wp
 
+from .....utils.device import check_conditional_capture, is_capturing
 from . import blas
 from .core import DenseLinearOperatorData
 from .sparse_matrix import BlockSparseMatrices
@@ -384,8 +385,9 @@ def _run_capturable_loop(
         if callback_launch is not None:
             callback_launch.launch()
 
-    if use_graph and device.is_capturing:
+    if use_graph and is_capturing(device):
         if use_graph_conditionals:
+            check_conditional_capture(device, "Kamino's iterative linear solver")
             wp.capture_while(global_condition, do_cycle_with_condition)
         else:
             for _ in range(0, int(maxiter_host), loop_granularity):

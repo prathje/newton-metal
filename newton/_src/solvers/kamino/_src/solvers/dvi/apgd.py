@@ -113,6 +113,7 @@ early termination. There is no fixed-loop fallback.
 
 import warp as wp
 
+from ......utils.device import check_conditional_capture
 from . import apgd_kernels as kernels
 
 
@@ -263,6 +264,7 @@ class UnilateralAPGD:
             block_iteration: Current bilateral/unilateral alternation index.
                 A negative value bypasses per-world alternation limits.
         """
+        check_conditional_capture(self.device, "Kamino's DVI APGD solver")
         self.problem = problem
         data = problem.data
         owner = self.owner

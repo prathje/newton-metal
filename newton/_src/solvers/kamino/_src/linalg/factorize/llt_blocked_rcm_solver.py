@@ -31,6 +31,7 @@ from typing import Any
 import warp as wp
 
 from ......core.types import override
+from ......utils.device import is_capturing
 from ...core.types import FloatType, to_warp_int32_array
 from ..core import DenseLinearOperatorData, DenseSquareMultiLinearInfo
 from ..linear import DirectSolver
@@ -305,7 +306,7 @@ class LLTBlockedRCMSolver(DirectSolver[wp.float32, wp.int32]):
         Changing this topology requires reconfiguration and graph recapture.
         Numerical resets retain the topology but invalidate its ordered mask.
         """
-        if self._device.is_capturing:
+        if is_capturing(self._device):
             raise RuntimeError("Configure sparse assembly before graph capture.")
         self._structural_pairs = None
         self._structural_pattern = None
@@ -505,9 +506,9 @@ class LLTBlockedRCMSolver(DirectSolver[wp.float32, wp.int32]):
             self._structural_ready.zero_()
         info = self._operator.info
         num_blocks = info.num_blocks
-        is_capturing = bool(self._device.is_capturing)
+        capturing = is_capturing(self._device)
         capture_id = None
-        if is_capturing and self._device.is_cuda:
+        if capturing and self._device.is_cuda:
             capture = self._device.captures.get(self._device.stream)
             if capture is not None:
                 capture_id = capture.capture_id
@@ -517,11 +518,11 @@ class LLTBlockedRCMSolver(DirectSolver[wp.float32, wp.int32]):
         # flags after capture, so an unlaunched or aborted graph cannot leave
         # the replacement permutation buffers marked as initialized.
         if self._reuse_permutation and self._permutation_initialized_during_capture:
-            if is_capturing and capture_id != self._permutation_capture_id:
+            if capturing and capture_id != self._permutation_capture_id:
                 self._permutation_initialized = False
                 self._permutation_initialized_during_capture = False
                 self._permutation_capture_id = None
-            elif not is_capturing:
+            elif not capturing:
                 valid = self._rcm_scratch["permutation_valid"].numpy()
                 valid_dims = self._rcm_scratch["permutation_dim"].numpy()
                 self._permutation_initialized = all(
@@ -542,7 +543,7 @@ class LLTBlockedRCMSolver(DirectSolver[wp.float32, wp.int32]):
             # Later calls are ordered behind these launches on the same stream,
             # including calls recorded later in the same CUDA graph capture.
             self._permutation_initialized = True
-            self._permutation_initialized_during_capture = self._reuse_permutation and is_capturing
+            self._permutation_initialized_during_capture = self._reuse_permutation and capturing
             self._permutation_capture_id = capture_id if self._permutation_initialized_during_capture else None
 
         # 2. Fused: build inv_P, permute A -> A_hat, and reduce |A_hat| into the

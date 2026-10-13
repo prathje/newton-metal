@@ -21,6 +21,7 @@ from __future__ import annotations
 import warp as wp
 
 __all__ = [
+    "check_conditional_capture",
     "is_capturing",
     "is_gpu",
     "is_metal",
@@ -108,3 +109,26 @@ def is_capturing(device: wp.DeviceLike = None) -> bool:
         # Private Warp state; drop once Metal reports Device.is_capturing.
         return getattr(wp_context.runtime, "_metal_capture_graph", None) is not None
     return False
+
+
+def check_conditional_capture(device: wp.DeviceLike, feature: str) -> None:
+    """Raise if ``device`` is recording a graph that cannot hold conditional nodes.
+
+    Outside a capture, :func:`warp.capture_while` and :func:`warp.capture_if`
+    evaluate their condition on the host, which works on every device. During
+    a Metal capture they would evaluate the condition once at record time and
+    bake that branch into the graph, so code that relies on them must not be
+    captured on Metal.
+
+    Args:
+        device: The device that launches the conditional work.
+        feature: Name of the caller, used in the error message.
+
+    Raises:
+        RuntimeError: If a Metal graph capture is active on ``device``.
+    """
+    if is_metal(device) and is_capturing(device):
+        raise RuntimeError(
+            f"{feature} uses wp.capture_while/wp.capture_if, which Metal graph capture does not support. "
+            "Run it outside graph capture on Metal devices."
+        )
