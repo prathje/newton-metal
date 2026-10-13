@@ -195,6 +195,11 @@ def get_test_devices(mode: str | None = None):
           "unique_or_2x" (default): Behaves like "unique" but adds up to one additional CUDA device
             if the system only devices of a single CUDA architecture.
           "all": Returns all available devices.
+
+    Metal devices are included in every mode when Warp's experimental Metal
+    backend is enabled (``WARP_ENABLE_METAL=1`` or ``wp.config.enable_metal``
+    before :func:`warp.init`). Warp builds without Metal, or with it disabled,
+    return the same devices as before.
     """
     if mode is None:
         mode = test_mode
@@ -207,11 +212,13 @@ def get_test_devices(mode: str | None = None):
             devices.append(wp.get_device("cpu"))
         if wp.is_cuda_available():
             devices.append(wp.get_device("cuda:0"))
+        devices.extend(get_metal_test_devices()[:1])
     elif mode == "unique" or mode == "unique_or_2x":
         # run on CPU and a subset of GPUs
         if wp.is_cpu_available():
             devices.append(wp.get_device("cpu"))
         devices.extend(get_selected_cuda_test_devices(mode))
+        devices.extend(get_metal_test_devices()[:1])
     elif mode == "all":
         # run on all devices
         devices = wp.get_devices()
@@ -221,9 +228,30 @@ def get_test_devices(mode: str | None = None):
     return devices
 
 
+def get_metal_test_devices():
+    """Returns the Metal devices registered with Warp.
+
+    Empty unless Warp's experimental Metal backend is enabled
+    (``WARP_ENABLE_METAL=1`` or ``wp.config.enable_metal`` before
+    :func:`warp.init`).
+    """
+    return [d for d in wp.get_devices() if getattr(d, "is_metal", False)]
+
+
 def get_cuda_test_devices(mode=None):
     devices = get_test_devices(mode=mode)
     return [d for d in devices if d.is_cuda]
+
+
+def get_gpu_test_devices(mode=None):
+    """Returns the CUDA and Metal devices from :func:`get_test_devices`.
+
+    Use it for tests that need a GPU but no CUDA-only feature such as streams,
+    conditional graphs, or texture SDFs; keep :func:`get_cuda_test_devices`
+    for those.
+    """
+    devices = get_test_devices(mode=mode)
+    return [d for d in devices if d.is_cuda or getattr(d, "is_metal", False)]
 
 
 def configure_sdf_for_collision_shapes(builder):
@@ -787,7 +815,11 @@ def is_statically_skipped_test(test):
 
 
 def cleanup_test_allocations():
-    """Release CPU allocations and unused CUDA mempool memory."""
+    """Release CPU allocations and unused CUDA mempool memory.
+
+    Metal devices have no memory pool; their buffers are released when the
+    owning arrays are garbage collected.
+    """
     import gc  # noqa: PLC0415
 
     gc.collect()
