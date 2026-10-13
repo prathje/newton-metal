@@ -18,6 +18,7 @@ import numpy as np
 import warp as wp
 
 from ..core.types import Devicelike
+from ..utils.device import is_capturing
 from .broad_phase_common import (
     binary_search,
     check_aabb_overlap_moving,
@@ -825,7 +826,7 @@ class BroadPhaseSAP:
                 device=device,
                 record_tape=False,
             )
-        elif self.world_count == 1 and not device_obj.is_capturing:
+        elif self.world_count == 1 and not is_capturing(device_obj):
             # A single segment does not need segmented-sort bookkeeping.
             wp.utils.radix_sort_pairs(
                 keys=self.sap_projection_lower,
