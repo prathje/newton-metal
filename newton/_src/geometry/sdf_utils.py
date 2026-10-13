@@ -10,6 +10,7 @@ import numpy as np
 import warp as wp
 
 from ..core.types import MAXVAL, Axis, Devicelike
+from ..utils.device import is_gpu
 from .kernels import sdf_box, sdf_capsule, sdf_cone, sdf_cylinder, sdf_ellipsoid, sdf_sphere
 from .sdf_mc import (
     MC_DEGENERATE_N_SQ_EPS,
@@ -1635,7 +1636,9 @@ def compute_offset_mesh_analytical(
 
     if device is None:
         cur = wp.get_device()
-        device = cur if cur.is_cuda else "cuda:0"
+        # The dense SDF and marching-cubes kernels run on any GPU; prefer the
+        # current one and otherwise fall back to the first CUDA device.
+        device = cur if is_gpu(cur) else "cuda:0"
 
     with wp.ScopedDevice(device):
         min_ext_list, max_ext_list = get_primitive_extents(shape_type, shape_scale)

@@ -14138,7 +14138,9 @@ class ModelBuilder:
 
             # ---------------------
             # Compute and compact texture SDF resources (shared table + per-shape index indirection)
-            is_gpu = current_device.is_cuda
+            # Texture SDFs need wp.Volume.allocate_by_tiles and wp.Texture3D,
+            # which only CUDA provides (Metal and CPU lack them).
+            supports_texture_sdf = current_device.is_cuda
 
             has_mesh_sdf = any(
                 stype in (GeoType.MESH, GeoType.CONVEX_MESH)
@@ -14168,11 +14170,11 @@ class ModelBuilder:
                 (sflags & ShapeFlags.HYDROELASTIC) and (sflags & ShapeFlags.COLLIDE_SHAPES)
                 for sflags in shape_flags_list
             )
-            if (has_mesh_sdf or has_deferred_mesh_sdf or has_hydroelastic_shapes) and not is_gpu:
+            if (has_mesh_sdf or has_deferred_mesh_sdf or has_hydroelastic_shapes) and not supports_texture_sdf:
                 raise ValueError(
-                    "Building texture SDFs requires a CUDA-capable GPU device. "
-                    "The texture SDF build path uses wp.Volume.allocate_by_tiles "
-                    "and wp.Texture3D, which are CUDA-only."
+                    "Building texture SDFs requires a CUDA-capable GPU device "
+                    f"(got {current_device}). The texture SDF build path uses "
+                    "wp.Volume.allocate_by_tiles and wp.Texture3D, which are CUDA-only."
                 )
 
             from ..geometry.sdf_texture import (  # noqa: PLC0415
