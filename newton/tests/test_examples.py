@@ -177,15 +177,12 @@ def add_example_test(
     expect_output_regexes: list[_OutputRegexSpec] | None = None,
     allow_output_regexes: list[_OutputRegexSpec] | None = None,
     *,
-    test_options_metal: dict[str, Any] | None = None,
     variants: list[dict[str, Any]] | None = None,
 ):
     """Register an example, optionally sharing a subprocess across argument variants.
 
-    Device-specific options are merged over ``test_options``: CUDA uses
-    ``test_options_cuda``, CPU uses ``test_options_cpu``, and Metal uses
-    ``test_options_metal`` when given and falls back to ``test_options_cuda``
-    otherwise, since both are GPUs.
+    Device-specific options are merged over ``test_options``: CUDA and Metal
+    use ``test_options_cuda`` and CPU uses ``test_options_cpu``.
     """
     if variants is None:
         variants = [
@@ -193,7 +190,6 @@ def add_example_test(
                 "test_options": test_options or {},
                 "test_options_cpu": test_options_cpu or {},
                 "test_options_cuda": test_options_cuda or {},
-                "test_options_metal": test_options_metal,
                 "expect_output_regexes": expect_output_regexes,
                 "allow_output_regexes": allow_output_regexes,
                 "test_suffix": test_suffix,
@@ -212,17 +208,15 @@ def add_example_test(
 
     def run(test, device):
         is_cuda = wp.get_device(device).is_cuda
-        is_metal = getattr(wp.get_device(device), "is_metal", False)
+        # Metal is a GPU too and shares the CUDA example options.
+        is_gpu = is_cuda or getattr(wp.get_device(device), "is_metal", False)
         cases = []
         for variant in variants:
             with test.subTest(variant=variant.get("test_suffix")):
-                if is_metal and variant.get("test_options_metal") is not None:
-                    device_options = variant["test_options_metal"]
-                elif is_cuda or is_metal:
-                    device_options = variant.get("test_options_cuda", {})
-                else:
-                    device_options = variant.get("test_options_cpu", {})
-                options = _merge_options(variant.get("test_options", {}), device_options)
+                options = _merge_options(
+                    variant.get("test_options", {}),
+                    variant.get("test_options_cuda" if is_gpu else "test_options_cpu", {}),
+                )
                 onnx_required = options.pop("onnx_required", False)
                 torch_required = options.pop("torch_required", False)
                 if (onnx_required or torch_required) and not _HAS_ONNX_RUNTIME:
@@ -232,12 +226,7 @@ def add_example_test(
                 timeout = options.pop("test_timeout", 600)
                 allow_deprecations = options.pop("allow_deprecation_warnings", False)
                 argv = ["--device", str(device), "--test", "--quiet"]
-                warp_config = list(newton.tests.unittest_utils.warp_config_overrides)
-                if is_metal and not any(entry.startswith("enable_metal=") for entry in warp_config):
-                    # The Metal backend is opt-in; enable it in the example
-                    # process even when this process enabled it via wp.config.
-                    warp_config.append("enable_metal=True")
-                for entry in warp_config:
+                for entry in newton.tests.unittest_utils.warp_config_overrides:
                     argv.extend(["--warp-config", entry])
                 stage_path = None
                 if use_viewer:

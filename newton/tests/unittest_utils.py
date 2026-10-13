@@ -243,17 +243,6 @@ def get_cuda_test_devices(mode=None):
     return [d for d in devices if d.is_cuda]
 
 
-def get_gpu_test_devices(mode=None):
-    """Returns the CUDA and Metal devices from :func:`get_test_devices`.
-
-    Use it for tests that need a GPU but no CUDA-only feature such as streams,
-    conditional graphs, or texture SDFs; keep :func:`get_cuda_test_devices`
-    for those.
-    """
-    devices = get_test_devices(mode=mode)
-    return [d for d in devices if d.is_cuda or getattr(d, "is_metal", False)]
-
-
 def configure_sdf_for_collision_shapes(builder):
     """Force volume-SDF construction on every mesh/convex shape that collides with particles.
 
