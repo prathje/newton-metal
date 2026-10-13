@@ -41,6 +41,7 @@ from ..geometry.types import GeoType
 from ..sim.contacts import GENERATION_SENTINEL, Contacts
 from ..sim.model import Model
 from ..sim.state import State
+from ..utils.device import supports_streams
 
 
 def _shape_collide_mask(model: Model, shape_count: int | None = None) -> np.ndarray:
@@ -2061,7 +2062,7 @@ class CollisionPipeline:
                 else _SPLIT_GJK_MPR_FULL_PAIR_COUNT_THRESHOLD
             )
             split_gjk_mpr = (
-                device.is_cuda
+                supports_streams(device)
                 and has_generic_convex_pairs
                 and generic_convex_pair_work_estimate >= split_pair_count_threshold
             )

@@ -82,6 +82,7 @@ from ..geometry.support_function import (
     support_map_lean_accelerated,
 )
 from ..geometry.types import GeoType
+from ..utils.device import is_metal, supports_cooperative_blocks, supports_streams
 from ..utils.heightfield import (
     HeightfieldData,
     get_triangle_shape_from_heightfield,
@@ -2536,11 +2537,13 @@ class NarrowPhase:
 
         # CPU kernels currently observe ``wp.block_dim() == 1`` regardless
         # of the plain ``wp.launch(..., block_dim=N)`` parameter (Warp
-        # GH-1413). Keep the mesh-convex midphase launch grid, tile shape,
-        # and kernel-side ``wp.block_dim()`` in sync on CPU.
+        # GH-1413), and Metal runs these tile kernels serially as well.
+        # Keep the mesh-convex midphase launch grid, tile shape, and
+        # kernel-side ``wp.block_dim()`` in sync on those devices.
         # Dense mesh queries benefit from wider cooperative result batches;
         # heightfields only use lane zero and retain the leaner launch.
-        self.tile_size_mesh_convex = 1 if device_obj.is_cpu else (128 if has_heightfields else 256)
+        cooperative_blocks = supports_cooperative_blocks(device_obj)
+        self.tile_size_mesh_convex = (128 if has_heightfields else 256) if cooperative_blocks else 1
         # Must match ``MESH_SDF_BLOCK_DIM`` in sdf_contact.py: the mesh-SDF
         # kernels assume ``wp.block_dim()`` equals that constant so the
         # tile-stack overflow margin (``STACK_CAPACITY = 2 *
@@ -2556,10 +2559,10 @@ class NarrowPhase:
         # which use ``self.tile_size_mesh_mesh`` above.
         #
         # Plain ``wp.launch`` does not auto-clamp ``block_dim`` on CPU like
-        # ``wp.launch_tiled`` does. Match the kernel-observed value so
-        # strided-loop and tile-index calculations cannot run past the CPU
-        # launch geometry.
-        self.block_dim = 1 if device_obj.is_cpu else 128
+        # ``wp.launch_tiled`` does, and Metal lowers ``wp.block_dim()`` to 1.
+        # Match the kernel-observed value so strided-loop and tile-index
+        # calculations cannot run past the launch geometry.
+        self.block_dim = 128 if cooperative_blocks else 1
         if sparse_gjk_pairs is None:
             sparse_gjk_pairs = device_obj.is_cuda and max_candidate_pairs >= _SPARSE_GJK_PAIR_CAPACITY_THRESHOLD
         self.sparse_gjk_pairs = sparse_gjk_pairs
@@ -2567,7 +2570,8 @@ class NarrowPhase:
             candidate_pair_work_estimate = max_candidate_pairs
         if candidate_pair_work_estimate < 0:
             raise ValueError("candidate_pair_work_estimate must be non-negative or None")
-        self.split_gjk_mpr = device_obj.is_cuda and has_generic_convex_pairs and split_gjk_mpr
+        # The split path overlaps two queues on separate CUDA streams.
+        self.split_gjk_mpr = supports_streams(device_obj) and has_generic_convex_pairs and split_gjk_mpr
         # Create the appropriate kernel variants
         # Primitive kernel handles lightweight primitives and routes remaining pairs
         self.primitive_kernel = create_narrow_phase_primitive_kernel(
@@ -2830,6 +2834,11 @@ class NarrowPhase:
             # Use 4 blocks per SM as a reasonable upper bound for occupancy
             # This balances parallelism with resource utilization
             max_blocks_limit = device_obj.sm_count * 4
+        elif is_metal(device_obj):
+            # Metal runs one lane per block here (``self.block_dim == 1``) and
+            # reports no SM count. Allow as many single-lane blocks as CUDA's
+            # minimum thread count so the GPU still gets a wide launch.
+            max_blocks_limit = 256 * 128
         else:
             # CPU fallback: use a conservative limit
             max_blocks_limit = 256

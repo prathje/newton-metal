@@ -6,6 +6,7 @@ from __future__ import annotations
 import warp as wp
 
 from ..math import quat_decompose, transform_twist, velocity_at_point
+from ..utils.device import supports_cooperative_blocks
 from .enums import BodyFlags, JointType
 from .model import Model
 from .state import State
@@ -576,7 +577,9 @@ def eval_fk(
     if num_articulations == 0:
         return
 
-    if model.device.is_cuda and model._fk_articulation_level_start is not None:
+    # The level-scheduled FK kernel splits each level across the lanes of a
+    # block; CPU and Metal run tile blocks serially and use the generic path.
+    if supports_cooperative_blocks(model.device) and model._fk_articulation_level_start is not None:
         requires_grad = (
             model.requires_grad
             or joint_q.requires_grad
