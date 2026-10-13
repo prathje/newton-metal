@@ -34,6 +34,7 @@ from newton._src.solvers.kamino.examples.rl.observations import BipedalObservati
 from newton._src.solvers.kamino.examples.rl.simulation import RigidBodySim
 from newton._src.solvers.kamino.examples.rl.simulation_runner import SimulationRunner
 from newton._src.solvers.kamino.examples.rl.utils import _load_policy_checkpoint, quat_to_projected_yaw
+from newton._src.utils.device import is_metal
 
 # Asset root relative to this file
 _ASSETS_DIR = os.path.normpath(
@@ -396,7 +397,7 @@ if __name__ == "__main__":
     msg.info(f"device: {device}")
 
     # Convert warp device to torch device string for checkpoint loading
-    torch_device = "mps" if getattr(device, "is_metal", False) else ("cuda" if device.is_cuda else "cpu")
+    torch_device = "mps" if is_metal(device) else ("cuda" if device.is_cuda else "cpu")
 
     # Load trained policy
     POLICY_PATH = os.path.join(_ASSETS_DIR, "bipedal", "model.pt")
