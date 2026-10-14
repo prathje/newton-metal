@@ -332,7 +332,11 @@ class Example:
     def capture(self):
         self.graph = None
         self.use_graph = False
-        if self.device.is_cpu or self.device.is_mempool_enabled:
+        if (
+            self.device.is_cpu
+            or self.device.is_mempool_enabled
+            or newton.examples.supports_graph_capture(self.device, allocation=True)
+        ):
             print("[INFO] Using graph capture")
             self.use_graph = True
             # Coord layout: 7 slots for the free base (3 position + 4 quaternion).

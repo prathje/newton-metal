@@ -220,7 +220,11 @@ class Example:
     def capture(self):
         self.graph = None
         self.use_graph = False
-        if self.device.is_cpu or self.device.is_mempool_enabled:
+        if (
+            self.device.is_cpu
+            or self.device.is_mempool_enabled
+            or newton.examples.supports_graph_capture(self.device, allocation=True)
+        ):
             self.use_graph = True
             self.control.joint_target_q = wp.zeros(
                 self._num_prefix_zeros + self._num_dofs, dtype=wp.float32, device=self.device

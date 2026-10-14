@@ -25,20 +25,34 @@ _DEPRECATED_WARP_CONFIG_KEYS = {"quiet", "verbose"}
 logger = logging.getLogger(__name__)
 
 
-def supports_graph_capture(device: wp.DeviceLike = None) -> bool:
+def supports_graph_capture(
+    device: wp.DeviceLike = None, *, conditional: bool = False, allocation: bool = False
+) -> bool:
     """Return whether examples should capture their simulation step on ``device``.
 
     True for CUDA devices and for Metal devices of Warp's experimental Metal
-    backend, and False for the CPU. Examples whose step relies on conditional
-    graph nodes (:func:`warp.capture_while` / :func:`warp.capture_if`) still
-    require CUDA, since Metal graphs cannot record them.
+    backend, and False for the CPU.
 
     Args:
         device: The Warp device to query. ``None`` uses the current device.
+        conditional: Also require :func:`warp.capture_while` /
+            :func:`warp.capture_if` support inside captures (CUDA 12.4+, or
+            a Metal build that records conditional work).
+        allocation: Also require that allocating arrays during capture is
+            safe (an enabled CUDA memory pool, or a Metal build that keeps
+            captured buffers alive across replays).
     """
+    from newton._src.utils.device import (  # noqa: PLC0415
+        supports_capture_allocation,
+        supports_conditional_graphs,
+    )
     from newton._src.utils.device import supports_graph_capture as _supports_graph_capture  # noqa: PLC0415
 
-    return _supports_graph_capture(device)
+    if not _supports_graph_capture(device):
+        return False
+    if conditional and not supports_conditional_graphs(device):
+        return False
+    return not allocation or supports_capture_allocation(device)
 
 
 def get_source_directory() -> str:
