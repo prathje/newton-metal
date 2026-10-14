@@ -234,6 +234,19 @@ def get_cuda_test_devices(mode=None):
     return [d for d in devices if d.is_cuda]
 
 
+def get_conditional_graph_test_devices(mode=None):
+    """Returns the CUDA test devices plus Metal devices that record conditional graphs.
+
+    Use for tests that capture :func:`warp.capture_while` / :func:`warp.capture_if`.
+    Without Metal (or on Warp builds whose Metal backend cannot record
+    conditionals) this equals :func:`get_cuda_test_devices`.
+    """
+    from newton._src.utils.device import supports_conditional_graphs  # noqa: PLC0415
+
+    metal = [d for d in get_metal_test_devices() if supports_conditional_graphs(d)]
+    return get_cuda_test_devices(mode=mode) + metal
+
+
 def configure_sdf_for_collision_shapes(builder):
     """Force volume-SDF construction on every mesh/convex shape that collides with particles.
 
