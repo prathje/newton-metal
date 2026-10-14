@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import warp as wp
 
-from ......utils.device import check_conditional_capture
+from ......utils.device import capture_while_budget, check_conditional_capture
 from ....config import PADMMSolverConfig
 from ...core.data import DataKamino
 from ...core.model import ModelKamino
@@ -413,8 +413,10 @@ class PADMMSolver:
         # Iterate until convergence or maximum number of iterations is reached
         step_fn = self._step_accel if self._use_acceleration else self._step
         if self._use_graph_conditionals:
-            check_conditional_capture(self._data.state.done.device, "PADMMSolver with use_graph_conditionals=True")
-            wp.capture_while(self._data.state.done, while_body=step_fn, problem=problem)
+            device = self._data.state.done.device
+            check_conditional_capture(device, "PADMMSolver with use_graph_conditionals=True")
+            with capture_while_budget(device, self._max_of_max_iters + 1):
+                wp.capture_while(self._data.state.done, while_body=step_fn, problem=problem)
         else:
             for _ in range(self._max_of_max_iters):
                 step_fn(problem)

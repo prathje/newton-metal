@@ -22,6 +22,7 @@ from newton._src.solvers.kamino._src.solvers.padmm.math import (
     project_to_coulomb_dual_cone,
 )
 from newton._src.solvers.kamino._src.utils import logger as msg
+from newton._src.utils.device import supports_conditional_graphs
 from newton.tests.kamino import setup_tests, test_context
 from newton.tests.kamino.utils.extract import (
     extract_delassus,
@@ -1003,7 +1004,8 @@ class TestPADMMSolver(unittest.TestCase):
         a world with a larger budget is not terminated early alongside it.
         """
         budgets = [3, 8]
-        modes = [False, True] if self.default_device.is_cuda else [False]
+        conditional = self.default_device.is_cuda or supports_conditional_graphs(self.default_device)
+        modes = [False, True] if conditional else [False]
 
         for use_graph_conditionals in modes:
             with self.subTest(use_graph_conditionals=use_graph_conditionals):
@@ -1041,6 +1043,16 @@ class TestPADMMSolver(unittest.TestCase):
 
                 status = solver.data.status.numpy()
                 self.assertEqual([int(status[w][1]) for w in range(len(budgets))], budgets)
+
+                if use_graph_conditionals and supports_conditional_graphs(self.default_device):
+                    # Replaying a captured solve must honor the same budgets.
+                    with wp.ScopedCapture(device=self.default_device) as capture:
+                        solver.coldstart()
+                        solver.solve(problem=test.problem)
+                    solver.data.status.zero_()
+                    wp.capture_launch(capture.graph)
+                    status = solver.data.status.numpy()
+                    self.assertEqual([int(status[w][1]) for w in range(len(budgets))], budgets)
 
     def assert_coulomb_cone_projection(self, cone: str, case: str, mu: float, x: list[float], expected: list[float]):
         """Assert one primal or dual Coulomb cone projection."""

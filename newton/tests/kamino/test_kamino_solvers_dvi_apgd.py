@@ -22,6 +22,7 @@ from newton._src.solvers.kamino._src.solvers.dvi import DVISolver
 from newton._src.solvers.kamino._src.solvers.dvi.apgd import UnilateralAPGD
 from newton._src.solvers.kamino._src.solvers.dvi.types import DVIConfigStruct, DVIStatus, convert_config_to_struct
 from newton._src.solvers.kamino.config import ConstrainedDynamicsConfig, DVIAPGDConfig, DVISolverConfig
+from newton._src.utils.device import is_metal, supports_conditional_graphs
 from newton.solvers import SolverKamino
 from newton.tests.kamino.test_kamino_solver_kamino_joint_friction import (
     _run_hold_and_breakaway_test,
@@ -30,13 +31,20 @@ from newton.tests.kamino.test_kamino_solver_kamino_joint_friction import (
 from newton.tests.kamino.test_kamino_solvers_dvi import _build_five_box_stack
 from newton.tests.kamino.utils.make import make_containers, update_containers
 from newton.tests.kamino.utils.solver_configs import make_dvi_dense_config, make_dvi_sparse_config
+from newton.tests.unittest_utils import get_metal_test_devices
 from newton.tests.utils import basics
 from newton.viewer import ViewerNull
 
 
 def _devices():
-    """Exercise CPU and the first CUDA device when available."""
-    return ["cpu"] + (["cuda:0"] if wp.is_cuda_available() else [])
+    """Exercise CPU, the first CUDA device, and Metal devices when available."""
+    return ["cpu"] + (["cuda:0"] if wp.is_cuda_available() else []) + [d.alias for d in get_metal_test_devices()]
+
+
+def _captures(device) -> bool:
+    """Return whether the tests capture APGD solves on ``device``."""
+    device = wp.get_device(device)
+    return device.is_cuda or (is_metal(device) and supports_conditional_graphs(device))
 
 
 def _problem(matrices, biases, families, friction, device, *, options=None, lower=None, upper=None, configs=None):
@@ -209,7 +217,7 @@ class TestDVIAPGD(unittest.TestCase):
 
                 solve()
                 graph = None
-                if solver.device.is_cuda:
+                if _captures(solver.device):
                     with wp.ScopedCapture(device=device) as capture:
                         solve()
                     graph = capture.graph
@@ -247,7 +255,7 @@ class TestDVIAPGD(unittest.TestCase):
                     device,
                 )
                 solver.solve(problem)
-                if solver.device.is_cuda:
+                if _captures(solver.device):
                     with wp.ScopedCapture(device=device) as capture:
                         solver.owner.data.solution.lambdas.zero_()
                         solver.owner.data.status.zero_()
@@ -290,7 +298,7 @@ class TestDVIAPGD(unittest.TestCase):
                     device,
                     configs=configs,
                 )
-                if solver.device.is_cuda:
+                if _captures(solver.device):
                     with wp.ScopedCapture(device=device) as capture:
                         solver.solve(problem)
                     wp.capture_launch(capture.graph)
@@ -325,7 +333,7 @@ class TestDVIAPGD(unittest.TestCase):
                     device,
                     configs=configs,
                 )
-                if solver.device.is_cuda:
+                if _captures(solver.device):
                     with wp.ScopedCapture(device=device) as capture:
                         solver.solve(problem)
                     wp.capture_launch(capture.graph)
@@ -367,7 +375,7 @@ class TestDVIAPGD(unittest.TestCase):
                     solver.solve(problem, block_iteration=1)
 
                 solve()
-                if solver.device.is_cuda:
+                if _captures(solver.device):
                     with wp.ScopedCapture(device=device) as capture:
                         solve()
                     wp.capture_launch(capture.graph)
@@ -543,7 +551,7 @@ class TestDVIAPGD(unittest.TestCase):
                     solver.solve(problem)
 
                 solve()
-                if solver.device.is_cuda:
+                if _captures(solver.device):
                     with wp.ScopedCapture(device=device) as capture:
                         solve()
                     wp.capture_launch(capture.graph)
@@ -581,7 +589,7 @@ class TestDVIAPGD(unittest.TestCase):
                 solve()
                 eager_status = solver.owner.data.status.numpy()
                 graph = None
-                if solver.device.is_cuda:
+                if _captures(solver.device):
                     with wp.ScopedCapture(device=device) as capture:
                         solve()
                     graph = capture.graph
@@ -688,7 +696,7 @@ class TestDVIAPGD(unittest.TestCase):
 
                 solve()
                 graph = None
-                if solver.device.is_cuda:
+                if _captures(solver.device):
                     with wp.ScopedCapture(device=device) as capture:
                         solve()
                     graph = capture.graph
@@ -815,7 +823,7 @@ class TestDVIAPGD(unittest.TestCase):
                 )
                 solver.coldstart()
                 solver.solve(problem)
-                if solver.device.is_cuda:
+                if _captures(solver.device):
                     eager_velocity = solver.data.solution.v_plus.numpy()
                     with wp.ScopedCapture(device=device) as capture:
                         solver.coldstart()
@@ -957,7 +965,7 @@ class TestDVIAPGDDynamics(unittest.TestCase):
                         solver.step(state_1, state_0, control=None, contacts=None, dt=dt)
 
                     step_pair()
-                    if wp.get_device(device).is_cuda:
+                    if _captures(device):
                         with wp.ScopedCapture(device=device) as capture:
                             step_pair()
                         for _ in range(49):

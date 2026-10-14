@@ -14,7 +14,7 @@ from typing import Any, Generic
 
 import warp as wp
 
-from .....utils.device import check_conditional_capture, is_capturing
+from .....utils.device import capture_while_budget, check_conditional_capture, is_capturing
 from . import blas
 from .core import DenseLinearOperatorData
 from .sparse_matrix import BlockSparseMatrices
@@ -388,7 +388,11 @@ def _run_capturable_loop(
     if use_graph and is_capturing(device):
         if use_graph_conditionals:
             check_conditional_capture(device, "Kamino's iterative linear solver")
-            wp.capture_while(global_condition, do_cycle_with_condition)
+            # Metal unrolls captured loops; one cycle per loop_granularity
+            # iterations, plus the cycle that observes termination.
+            max_cycles = -(-int(maxiter_host) // loop_granularity) + 1 if maxiter_host is not None else 1
+            with capture_while_budget(device, max_cycles):
+                wp.capture_while(global_condition, do_cycle_with_condition)
         else:
             for _ in range(0, int(maxiter_host), loop_granularity):
                 do_cycle_with_condition()

@@ -15,7 +15,12 @@ import numpy as np
 import warp as wp
 
 from ......sim import ModelFlags
-from ......utils.device import check_conditional_capture, is_metal
+from ......utils.device import (
+    capture_while_budget,
+    check_conditional_capture,
+    is_metal,
+    supports_conditional_graphs,
+)
 from ....config import ForwardKinematicsSolverConfig
 from ...core.joints import JointActuationType, JointDoFType
 from ...core.model import ModelKamino
@@ -1922,7 +1927,8 @@ class ForwardKinematicsSolver:
             self.data.gauss_newton.step, self.data.gauss_newton.grad, self.data.line_search.grad_0
         )
         self.data.line_search.alpha.fill_(1.0)
-        wp.capture_while(self.data.line_search.loop_condition, lambda: self._run_line_search_iteration(body_q))
+        with capture_while_budget(self.device, self.config.max_line_search_iterations + 1):
+            wp.capture_while(self.data.line_search.loop_condition, lambda: self._run_line_search_iteration(body_q))
 
         # Apply line search step and update max constraint
         wp.launch(
@@ -2489,7 +2495,8 @@ class ForwardKinematicsSolver:
             wp.capture_if(self.data.gauss_newton.loop_condition, lambda: self._initialize_incremental_solve(body_q))
 
         # Main loop
-        wp.capture_while(self.data.gauss_newton.loop_condition, lambda: self._run_newton_iteration(body_q))
+        with capture_while_budget(self.device, self.config.max_newton_iterations + 1):
+            wp.capture_while(self.data.gauss_newton.loop_condition, lambda: self._run_newton_iteration(body_q))
 
         # Velocity solve, for worlds where FK ran and was successful
         if body_u is not None:
@@ -2565,8 +2572,8 @@ class ForwardKinematicsSolver:
             )
 
         # Run solve (with or without graph). The solve loops with
-        # wp.capture_while, which Metal graphs cannot record.
-        if use_graph and not is_metal(self.device):
+        # wp.capture_while, which only some Metal builds can record.
+        if use_graph and (not is_metal(self.device) or supports_conditional_graphs(self.device)):
             if self.graph is None:
                 wp.capture_begin(self.device)
                 self.run_fk_solve(actuator_q, body_q, base_q, actuator_u, base_u, body_u, world_mask)

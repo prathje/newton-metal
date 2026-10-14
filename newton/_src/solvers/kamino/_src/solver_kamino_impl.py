@@ -16,7 +16,7 @@ import warp as wp
 # Newton imports
 from ....core.types import override
 from ....sim import Contacts, ModelFlags, State
-from ....utils.device import is_metal
+from ....utils.device import is_metal, supports_conditional_graphs
 from ...solver import SolverBase
 
 # Kamino imports
@@ -199,9 +199,11 @@ class SolverKaminoImpl(SolverBase):
                 )
                 self._config.sparse_jacobian = True
 
-        # Metal graphs cannot record conditional nodes. Unroll the PADMM and
-        # iterative linear-solver loops so steps stay capturable there.
-        if is_metal(self._model.device) and self._config.padmm.use_graph_conditionals:
+        # Metal graphs without conditional support cannot record conditional
+        # nodes. Unroll the PADMM and iterative linear-solver loops so steps
+        # stay capturable there.
+        device = self._model.device
+        if is_metal(device) and not supports_conditional_graphs(device) and self._config.padmm.use_graph_conditionals:
             msg.info("Metal graphs do not support conditional nodes. Disabling padmm.use_graph_conditionals.")
             self._config.padmm.use_graph_conditionals = False
 
