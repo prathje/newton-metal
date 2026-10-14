@@ -12,7 +12,7 @@ import numpy as np
 import warp as wp
 
 from ..geometry.flags import ShapeFlags
-from ..utils.device import check_conditional_capture
+from ..utils.device import check_conditional_capture, is_capturing, is_metal
 from .collide import CollisionPipeline
 from .state import State
 
@@ -163,9 +163,9 @@ class CollisionSubstepScheduler:
 
     :meth:`step` works both directly and during CUDA graph capture. When an
     outer capture is active, the complete fixed schedule is recorded inline.
-    CUDA graph conditional nodes require CUDA 12.4 or newer. Metal graphs
-    cannot record conditional nodes, so on Metal call :meth:`step` outside
-    graph capture.
+    CUDA graph conditional nodes require CUDA 12.4 or newer. Metal graph
+    capture requires a Warp build whose Metal backend records conditional
+    work; otherwise call :meth:`step` outside graph capture on Metal.
 
     The two states are used as ping-pong buffers. ``substeps`` must be even so
     every frame begins and ends in ``states[0]``. Callbacks must be capture-safe
@@ -321,10 +321,30 @@ class CollisionSubstepScheduler:
             on_false=lambda: self._dispatch_collision(substep_index, interval_index + 1),
         )
 
+    def _dispatch_collision_flat(self, substep_index: int) -> None:
+        """Record one gated refresh per interval instead of a nested selection.
+
+        ``_interval_conditions`` is one-hot, so exactly one branch runs, as in
+        :meth:`_dispatch_collision`. Metal graphs nest conditionals at most
+        eight levels deep, which the nested selection exceeds for more than
+        a few intervals.
+        """
+        remaining = self._substeps - substep_index
+        state = self._states[substep_index % 2]
+        for interval_index, interval in enumerate(self._collision_intervals):
+            collision_dt = min(interval, remaining) * self._substep_dt
+            wp.capture_if(
+                self._interval_condition_views[interval_index],
+                on_true=lambda collision_dt=collision_dt: self._collision_callback(state, collision_dt),
+            )
+
     def step(self) -> None:
         """Execute or record one complete fixed-substep frame."""
         model = self._model
         check_conditional_capture(model.device, "CollisionSubstepScheduler.step")
+        dispatch_collision = self._dispatch_collision
+        if is_metal(model.device) and is_capturing(model.device):
+            dispatch_collision = self._dispatch_collision_flat
         for substep_index in range(self._substeps):
             state_in = substep_index % 2
             state = self._states[state_in]
@@ -367,11 +387,11 @@ class CollisionSubstepScheduler:
                 device=model.device,
             )
             if substep_index == 0:
-                self._dispatch_collision(substep_index)
+                dispatch_collision(substep_index)
             else:
                 wp.capture_if(
                     self._collision_due,
-                    on_true=lambda substep_index=substep_index: self._dispatch_collision(substep_index),
+                    on_true=lambda substep_index=substep_index: dispatch_collision(substep_index),
                 )
             self._substep_callback(self._states[state_in], self._states[1 - state_in], self._substep_dt)
         wp.launch(
