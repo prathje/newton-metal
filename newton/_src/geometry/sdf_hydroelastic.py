@@ -41,6 +41,7 @@ from newton._src.core.types import MAXVAL, Devicelike
 
 from ..sim.builder import ShapeFlags
 from ..sim.model import Model
+from ..utils.device import is_metal
 from .collision_core import sat_box_intersection
 from .contact_data import ContactData
 from .contact_reduction import get_slot
@@ -780,14 +781,23 @@ class HydroelasticSDF:
         self, texture_sdf_data: wp.array[TextureSDFData], shape_sdf_index: wp.array[wp.int32]
     ) -> None:
         """Cache finalized per-shape texture SDF descriptors."""
-        wp.launch(
-            kernel=cache_shape_texture_sdf_data_kernel,
-            dim=shape_sdf_index.shape[0],
-            inputs=[texture_sdf_data, shape_sdf_index],
-            outputs=[self._shape_sdf_data],
-            device=self.device,
-            record_tape=False,
-        )
+        try:
+            wp.launch(
+                kernel=cache_shape_texture_sdf_data_kernel,
+                dim=shape_sdf_index.shape[0],
+                inputs=[texture_sdf_data, shape_sdf_index],
+                outputs=[self._shape_sdf_data],
+                device=self.device,
+                record_tape=False,
+            )
+        except NotImplementedError as error:
+            if not is_metal(self.device):
+                raise
+            raise NotImplementedError(
+                "Hydroelastic contacts are not supported on Metal with this Warp build: its Metal "
+                "backend cannot compile the hydroelastic kernels (for example, writes to fields of "
+                "struct-array elements). Use a CUDA device for hydroelastic contacts."
+            ) from error
 
     def _validate_deterministic(self, deterministic: bool) -> None:
         """Raise if ``deterministic`` disagrees with the mode chosen at construction.
