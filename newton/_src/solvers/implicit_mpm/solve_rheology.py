@@ -16,7 +16,7 @@ import warp.sparse as sp
 from warp.fem.linalg import array_axpy
 from warp.optim.linear import LinearOperator, cg, cr, gmres
 
-from ...utils.device import is_capturing, supports_cooperative_blocks
+from ...utils.device import capture_while_budget, is_capturing, supports_cooperative_blocks
 from .contact_solver_kernels import (
     apply_nodal_impulse_warmstart,
     apply_subgrid_impulse,
@@ -1850,11 +1850,14 @@ def _run_solver_loop(
                 )
 
         device = rheology_solver.device
+        # Metal unrolls captured loops: one cycle per solve_granularity
+        # iterations, plus the first and the terminating cycle.
+        loop_budget = capture_while_budget(device, max_iterations // solve_granularity + 2)
         if device.is_capturing:
-            with _ScopedDisableGC():
+            with _ScopedDisableGC(), loop_budget:
                 wp.capture_while(condition, do_iteration_with_condition)
         else:
-            with _ScopedDisableGC():
+            with _ScopedDisableGC(), loop_budget:
                 with wp.ScopedCapture(force_module_load=False) as capture:
                     wp.capture_while(condition, do_iteration_with_condition)
             solve_graph = capture.graph
