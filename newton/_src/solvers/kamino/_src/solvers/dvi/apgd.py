@@ -113,7 +113,7 @@ early termination. There is no fixed-loop fallback.
 
 import warp as wp
 
-from ......utils.device import check_conditional_capture
+from ......utils.device import capture_while_budget, check_conditional_capture
 from . import apgd_kernels as kernels
 
 
@@ -158,6 +158,10 @@ class UnilateralAPGD:
             entry.relaxation = config.relaxation
             entries.append(entry)
         self.config = wp.array(entries, dtype=kernels.APGDConfig, device=self.device)
+        # Iteration bounds of the captured loops, used to size Metal's unrolled replay.
+        self._max_backtracks = max((c.max_backtracks for c in configs), default=1)
+        self._max_iterations = max((c.max_iterations for c in configs), default=1)
+        self._max_corrections = max((c.max_nonlinear_corrections for c in configs), default=1)
         self.state = wp.zeros(size.num_worlds, dtype=kernels.APGDState, device=self.device)
         self.phase = wp.zeros(size.num_worlds, dtype=wp.bool, device=self.device)
         self.active = wp.zeros_like(self.phase)
@@ -371,7 +375,8 @@ class UnilateralAPGD:
             self.matvec(self.y, self.product_y, self.inner)
             self.search_condition.zero_()
             self._launch(kernels.begin_iteration, [self.inner, self.state, self.searching, self.search_condition])
-            wp.capture_while(self.search_condition, while_body=search_body)
+            with capture_while_budget(self.device, self._max_backtracks):
+                wp.capture_while(self.search_condition, while_body=search_body)
             self.inner_condition.zero_()
             self._launch(
                 kernels.accept_iteration,
@@ -416,7 +421,8 @@ class UnilateralAPGD:
                 ],
                 rows=True,
             )
-            wp.capture_while(self.inner_condition, while_body=inner_body)
+            with capture_while_budget(self.device, self._max_iterations):
+                wp.capture_while(self.inner_condition, while_body=inner_body)
             self._launch(
                 kernels.relax_correction, [*layout, self.active, self.config, self.previous, self.x], rows=True
             )
@@ -438,6 +444,7 @@ class UnilateralAPGD:
                 ],
             )
 
-        wp.capture_while(self.correction_condition, while_body=correction_body)
+        with capture_while_budget(self.device, self._max_corrections):
+            wp.capture_while(self.correction_condition, while_body=correction_body)
         self._launch(kernels.scatter_solution, [*layout, self.phase, self.x, solution], rows=True)
         self._launch(kernels.finish_phase, [self.phase, self.state, status])

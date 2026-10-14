@@ -23,10 +23,12 @@ from newton._src.solvers.kamino._src.linalg.sparse_matrix import (
     dense_to_block_sparse_copy_values,
 )
 from newton._src.solvers.kamino._src.linalg.utils.rand import random_spd_matrix
+from newton._src.utils.device import supports_conditional_graphs
 from newton.tests.kamino import setup_tests, test_context
 from newton.tests.kamino.utils.extract import get_vector_block
 from newton.tests.kamino.utils.print import print_error_stats
 from newton.tests.kamino.utils.rand import RandomProblemLLT
+from newton.tests.unittest_utils import get_metal_test_devices
 
 
 class TestLinalgConjugate(unittest.TestCase):
@@ -205,7 +207,8 @@ class TestLinalgConjugate(unittest.TestCase):
         try:
             with wp.ScopedCapture(device) as cap:
                 cap_cur, _, _ = solver.solve(problem.b_wp, x_capture)
-        except NotImplementedError as e:
+        except (NotImplementedError, RuntimeError) as e:
+            # Metal raises RuntimeError for the same strided-copy limitation.
             if "non-contiguous" not in str(e):
                 raise
             self.skipTest(f"Warp graph capture limitation on {device}: {e}")
@@ -230,6 +233,18 @@ class TestLinalgConjugate(unittest.TestCase):
         if not wp.get_cuda_devices():
             self.skipTest("No CUDA devices found")
         self._test_capture_replay_matches_eager(CRSolver, wp.get_cuda_device())
+
+    def test_capture_replay_cg_metal(self):
+        devices = [d for d in get_metal_test_devices() if supports_conditional_graphs(d)]
+        if not devices:
+            self.skipTest("No Metal device with conditional graph capture found")
+        self._test_capture_replay_matches_eager(CGSolver, devices[0])
+
+    def test_capture_replay_cr_metal(self):
+        devices = [d for d in get_metal_test_devices() if supports_conditional_graphs(d)]
+        if not devices:
+            self.skipTest("No Metal device with conditional graph capture found")
+        self._test_capture_replay_matches_eager(CRSolver, devices[0])
 
     def _test_sparse_solve(self, solver_cls, dims, block_size, device):
         """Test CG/CR with sparse matrices built from random SPD matrices.
