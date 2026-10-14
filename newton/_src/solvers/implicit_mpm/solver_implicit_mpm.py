@@ -2134,11 +2134,11 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
         """
         self.validate_observables(observables, contacts)
         model = self.model
-        if is_metal(model.device) and is_capturing(model.device):
+        if is_metal(model.device) and not supports_conditional_graphs(model.device) and is_capturing(model.device):
             raise RuntimeError(
-                "SolverImplicitMPM.step() cannot be graph-captured on Metal: without conditional graph "
-                "nodes its iterative solves check convergence on the host. Call step() outside graph "
-                "capture on Metal devices."
+                "SolverImplicitMPM.step() cannot be graph-captured on Metal with this Warp build: without "
+                "conditional graph nodes its iterative solves check convergence on the host. Call step() "
+                "outside graph capture on Metal devices."
             )
 
         with wp.ScopedDevice(model.device):

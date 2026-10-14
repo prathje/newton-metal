@@ -50,10 +50,16 @@ from newton._src.solvers.implicit_mpm.solve_rheology import (
     solve_rheology,
     update_batched_condition,
 )
+from newton._src.utils.device import supports_conditional_graphs
 from newton.examples.mpm.example_mpm_viscous import Example as MPMViscousExample
 from newton.solvers import SolverImplicitMPM, SolverXPBD
 from newton.solvers.experimental.coupled import SolverCoupled, SolverCoupledProxy
-from newton.tests.unittest_utils import add_function_test, get_cuda_test_devices, get_test_devices
+from newton.tests.unittest_utils import (
+    add_function_test,
+    get_conditional_graph_test_devices,
+    get_cuda_test_devices,
+    get_test_devices,
+)
 
 
 def test_sparse_contact_preserves_first_interpolation(test, device):
@@ -2328,9 +2334,9 @@ def test_cg_rheology_whole_step_graph_capture(test, device):
     device-side results back. The scene has no colliders so ``solver="cg"`` is
     admissible.
     """
-    if not device.is_cuda:
+    if not device.is_cuda and not supports_conditional_graphs(device):
         test.skipTest("whole-step graph capture requires a CUDA device")
-    if not wp.is_conditional_graph_supported():
+    if not supports_conditional_graphs(device):
         test.skipTest("whole-step graph capture requires conditional CUDA graph support")
 
     voxel_size = 0.1
@@ -2928,7 +2934,9 @@ add_function_test(
     devices=devices,
 )
 add_function_test(TestImplicitMPM, "test_majorized_rheology_solve", test_majorized_rheology_solve, devices=devices)
-add_function_test(TestImplicitMPM, "test_majorizer_capture", test_majorizer_capture, devices=get_cuda_test_devices())
+add_function_test(
+    TestImplicitMPM, "test_majorizer_capture", test_majorizer_capture, devices=get_conditional_graph_test_devices()
+)
 add_function_test(
     TestImplicitMPM,
     "test_rheology_residual_inactive_strain_nodes",
@@ -2947,7 +2955,7 @@ add_function_test(
     TestImplicitMPM,
     "test_majorized_rheology_capture",
     test_majorized_rheology_solve,
-    devices=get_cuda_test_devices(),
+    devices=get_conditional_graph_test_devices(),
     capture=True,
 )
 add_function_test(
