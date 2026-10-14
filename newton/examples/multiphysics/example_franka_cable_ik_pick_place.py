@@ -71,6 +71,12 @@ def set_gripper_q(joint_q: wp.array2d[float], finger_pos: wp.array[float], idx0:
 
 
 @wp.kernel
+def copy_arm_targets(ik_joint_q: wp.array2d[float], joint_target_q: wp.array2d[float]):
+    world_idx, coord_idx = wp.tid()
+    joint_target_q[world_idx, coord_idx] = ik_joint_q[world_idx, coord_idx]
+
+
+@wp.kernel
 def set_task_targets(
     target_positions: wp.array[wp.vec3],
     target_rotations: wp.array[wp.vec4],
@@ -480,7 +486,16 @@ class Example:
             inputs=[self.ik_joint_q, self.finger_pos_buf, self.finger_idx0, self.finger_idx1],
             device=self.device,
         )
-        wp.copy(dest=self.control_joint_target_q[:, : self.n_coords], src=self.ik_joint_q)
+        if getattr(self.device, "is_metal", False):
+            # Metal graph capture cannot record strided wp.copy transfers.
+            wp.launch(
+                copy_arm_targets,
+                dim=self.ik_joint_q.shape,
+                inputs=[self.ik_joint_q, self.control_joint_target_q],
+                device=self.device,
+            )
+        else:
+            wp.copy(dest=self.control_joint_target_q[:, : self.n_coords], src=self.ik_joint_q)
 
         for _ in range(self.sim_substeps):
             self.state_0.clear_forces()
