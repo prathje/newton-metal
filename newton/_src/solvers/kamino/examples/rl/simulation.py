@@ -34,7 +34,7 @@ from newton._src.solvers.kamino._src.utils import logger as msg
 from newton._src.solvers.kamino._src.utils.sim import Simulator
 from newton._src.solvers.kamino._src.utils.viewer import Color3, ViewerConfig
 from newton._src.solvers.kamino.solver_kamino import SolverKamino
-from newton._src.utils.device import is_metal
+from newton._src.utils.device import is_metal, supports_capture_allocation
 from newton._src.viewer import ViewerGL
 
 
@@ -615,7 +615,10 @@ class RigidBodySim:
         """Capture CUDA graphs for step and reset if requested and available."""
         if not self._use_cuda_graph:
             return
-        if not (self._device.is_cuda and wp.is_mempool_enabled(self._device)):
+        if not (
+            (self._device.is_cuda and wp.is_mempool_enabled(self._device))
+            or (is_metal(self._device) and supports_capture_allocation(self._device))
+        ):
             msg.warning("CUDA graphs requested but not available (need CUDA device with mempool). Using kernels.")
             return
 
