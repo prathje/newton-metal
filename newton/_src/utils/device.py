@@ -29,6 +29,7 @@ __all__ = [
     "is_capturing",
     "is_gpu",
     "is_metal",
+    "supports_capture_allocation",
     "supports_conditional_graphs",
     "supports_cooperative_blocks",
     "supports_graph_capture",
@@ -93,6 +94,23 @@ def supports_conditional_graphs(device: wp.DeviceLike = None) -> bool:
     if is_metal(device):
         return supports_graph_capture(device) and _metal_records_conditionals()
     return False
+
+
+def supports_capture_allocation(device: wp.DeviceLike = None) -> bool:
+    """Return whether allocating device memory during a graph capture is safe on ``device``.
+
+    CUDA needs its stream-ordered memory pool so that allocations become
+    graph memory nodes. Metal builds that record conditional work also keep
+    every buffer a captured command references alive for the graph's
+    lifetime and record the fills of new arrays, which matches CUDA's
+    semantics. CPU allocation is always safe.
+    """
+    device = wp.get_device(device)
+    if device.is_cpu:
+        return True
+    if is_metal(device):
+        return supports_graph_capture(device) and _metal_records_conditionals()
+    return device.is_mempool_enabled
 
 
 def supports_streams(device: wp.DeviceLike = None) -> bool:
