@@ -11,7 +11,7 @@ import sys
 import warnings
 from array import array
 from collections.abc import Iterable
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import TYPE_CHECKING, Any
@@ -39,7 +39,7 @@ from ...sim.contacts import GENERATION_SENTINEL as _GENERATION_SENTINEL
 from ...sim.graph_coloring import color_graph, plot_graph
 from ...utils import topological_sort
 from ...utils.benchmark import event_scope
-from ...utils.device import is_capturing, is_metal
+from ...utils.device import capture_while_budget, is_capturing, is_metal, supports_conditional_graphs
 from ...utils.import_utils import string_to_warp
 from ..coupled.interface import CouplingEndpointKind, CouplingInterface
 from ..solver import SolverBase
@@ -4628,8 +4628,21 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         """Prepare and apply all solver-local MJWarp compilation options."""
         self._apply_module_options()
         self._prepare_generated_kernels()
-        with self._scoped_deterministic_config():
+        loop_budget = (
+            capture_while_budget(self.device, self._capture_while_bound()) if is_metal(self.device) else nullcontext()
+        )
+        with self._scoped_deterministic_config(), loop_budget:
             yield
+
+    def _capture_while_bound(self) -> int:
+        """Return an upper bound on MJWarp ``capture_while`` iteration counts.
+
+        MJWarp loops over constraint-solver iterations and, for flex
+        collisions, up to ``mjMAXCONPAIR`` farthest-point-sampling steps.
+        Metal sizes its unrolled replay of captured loops from this bound.
+        """
+        iterations = int(getattr(self.mjw_model.opt, "iterations", 0)) if self.mjw_model is not None else 0
+        return max(iterations, int(self._mujoco.mjMAXCONPAIR)) + 1
 
     @event_scope
     def _mujoco_warp_step(self):
@@ -8236,9 +8249,9 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 # the authoring policy on the CPU model for inspection and MJCF export.
                 self.mj_model.tree_sleep_policy[:] = sleep_policies
 
-            if is_metal(model.device):
-                # Metal graphs cannot record conditional nodes. Run the fixed
-                # iteration loops instead so steps can still be captured.
+            if is_metal(model.device) and not supports_conditional_graphs(model.device):
+                # This Metal build cannot record conditional nodes. Run the
+                # fixed iteration loops instead so steps can still be captured.
                 self.mjw_model.opt.graph_conditional = False
 
             # patch mjw_model with mesh_pos if it doesn't have it
