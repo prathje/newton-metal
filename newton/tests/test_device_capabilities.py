@@ -4,21 +4,34 @@
 """Tests for the internal device capability helpers in ``newton._src.utils.device``."""
 
 import contextlib
+import gc
 import unittest
 
 import numpy as np
 import warp as wp
 
+from newton._src.utils import is_graph_capture_allocation_enabled
 from newton._src.utils.device import (
     active_capture_key,
     capture_while_budget,
     check_conditional_capture,
     is_capturing,
     is_metal,
+    supports_capture_allocation,
     supports_conditional_graphs,
     supports_graph_capture,
 )
 from newton.tests.unittest_utils import add_function_test, get_metal_test_devices, get_test_devices
+
+
+@wp.kernel
+def _add_one(values: wp.array[float]):
+    values[wp.tid()] += 1.0
+
+
+@wp.kernel
+def _copy(src: wp.array[float], dst: wp.array[float]):
+    dst[wp.tid()] = src[wp.tid()]
 
 
 @wp.kernel
@@ -34,6 +47,8 @@ def test_cpu_capabilities(test, device):
     test.assertFalse(is_capturing(device))
     test.assertIsNone(active_capture_key(device))
     test.assertIsInstance(capture_while_budget(device, 7), contextlib.nullcontext)
+    test.assertTrue(supports_capture_allocation(device))
+    test.assertTrue(is_graph_capture_allocation_enabled(device))
     # Outside a Metal capture the check never raises.
     check_conditional_capture(device, "test")
 
@@ -93,6 +108,37 @@ def test_metal_conditional_capture(test, device):
         wp.synchronize_device(device)
 
 
+def test_metal_capture_allocation(test, device):
+    """Arrays allocated during a Metal capture behave like CUDA graph allocations."""
+    supported = supports_capture_allocation(device)
+    test.assertEqual(is_graph_capture_allocation_enabled(device), supported)
+    if not supported:
+        return
+
+    n = 1024
+    out = wp.zeros(n, dtype=float, device=device)
+    with wp.ScopedCapture(device=device) as capture:
+        # The zero fill of an array allocated during capture is recorded and
+        # runs on every replay, as with a CUDA graph memset node.
+        values = wp.zeros(n, dtype=float, device=device)
+        wp.launch(_add_one, dim=n, inputs=[values], device=device)
+        wp.launch(_copy, dim=n, inputs=[values, out], device=device)
+    for _ in range(2):
+        wp.capture_launch(capture.graph)
+        np.testing.assert_array_equal(values.numpy(), 1.0)
+
+    # The graph keeps its buffers alive after the Python array is gone, and
+    # later allocations do not alias them.
+    del values
+    gc.collect()
+    others = [wp.full(n, -7.0, dtype=float, device=device) for _ in range(8)]
+    out.zero_()
+    wp.capture_launch(capture.graph)
+    np.testing.assert_array_equal(out.numpy(), 1.0)
+    for other in others:
+        np.testing.assert_array_equal(other.numpy(), -7.0)
+
+
 class TestDeviceCapabilities(unittest.TestCase):
     pass
 
@@ -110,6 +156,12 @@ add_function_test(
     TestDeviceCapabilities,
     "test_metal_conditional_capture",
     test_metal_conditional_capture,
+    devices=get_metal_test_devices(),
+)
+add_function_test(
+    TestDeviceCapabilities,
+    "test_metal_capture_allocation",
+    test_metal_capture_allocation,
     devices=get_metal_test_devices(),
 )
 
