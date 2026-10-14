@@ -9,8 +9,9 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.utils.device import supports_conditional_graphs
 from newton.solvers import SolverXPBD
-from newton.tests.unittest_utils import add_function_test, get_cuda_test_devices, get_test_devices
+from newton.tests.unittest_utils import add_function_test, get_conditional_graph_test_devices, get_test_devices
 
 
 @wp.kernel
@@ -38,7 +39,7 @@ def _measure_sphere_separation(body_q: wp.array[wp.transform], minimum: wp.array
 
 def test_collision_schedule_horizon_deadline(test, device, external_capture=False):
     """Honor prediction deadlines despite rounded intervals and changing velocities."""
-    if external_capture and not wp.is_conditional_graph_supported():
+    if external_capture and not supports_conditional_graphs(device):
         test.skipTest("CUDA graph capture requires conditional graph support")
     for substeps in (10, 12, 20):
         for profile in (
@@ -201,7 +202,7 @@ def test_collision_schedule_refreshes_for_shape_acceleration(test, device):
 
 def test_collision_schedule_refreshes_for_velocity_changes(test, device, external_capture=False):
     """Refresh after slowing, reversing, or turning without increasing speed."""
-    if external_capture and not wp.is_conditional_graph_supported():
+    if external_capture and not supports_conditional_graphs(device):
         test.skipTest("CUDA graph capture requires conditional graph support")
     for velocity in ((0.0, 0.0, 0.0), (-1.0, 0.0, 0.0), (0.0, 1.0, 0.0)):
         with test.subTest(velocity=velocity):
@@ -239,7 +240,7 @@ def test_collision_schedule_refreshes_for_velocity_changes(test, device, externa
 
 def test_collision_schedule_ignores_visual_shapes(test, device, external_capture=False):
     """Ignore visual-only motion when selecting refreshes and reporting overflow."""
-    if external_capture and not wp.is_conditional_graph_supported():
+    if external_capture and not supports_conditional_graphs(device):
         test.skipTest("CUDA graph capture requires conditional graph support")
     builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
     stationary = builder.add_body()
@@ -274,7 +275,7 @@ def test_collision_schedule_ignores_visual_shapes(test, device, external_capture
 
 def test_collision_schedule_stopping_leader(test, device, external_capture=False):
     """Keep following spheres separated when the leading sphere stops at a wall."""
-    if external_capture and not wp.is_conditional_graph_supported():
+    if external_capture and not supports_conditional_graphs(device):
         test.skipTest("CUDA graph capture requires conditional graph support")
     for substeps in (20, 100):
         with test.subTest(substeps=substeps):
@@ -387,7 +388,7 @@ def test_collision_schedule_preserves_integer_time_limits(test, device):
 
 def test_collision_schedule_nondivisor_intervals(test, device, external_capture=False):
     """Use nondivisor caps and travel horizons, truncating at frame boundaries."""
-    if external_capture and not wp.is_conditional_graph_supported():
+    if external_capture and not supports_conditional_graphs(device):
         test.skipTest("CUDA graph capture requires conditional graph support")
     substeps = 14
     for speed, limit in ((0.0, 6.5), (0.1, None), (0.0, 28.0)):
@@ -514,7 +515,7 @@ for name, function in (
         TestCollisionSchedule,
         f"test_collision_schedule_{name}_capture",
         function,
-        devices=get_cuda_test_devices(),
+        devices=get_conditional_graph_test_devices(),
         external_capture=True,
     )
 
@@ -529,7 +530,7 @@ add_function_test(
     TestCollisionSchedule,
     "test_collision_schedule_horizon_deadline_capture",
     test_collision_schedule_horizon_deadline,
-    devices=get_cuda_test_devices(),
+    devices=get_conditional_graph_test_devices(),
     external_capture=True,
 )
 
@@ -569,7 +570,7 @@ add_function_test(
     TestCollisionSchedule,
     "test_collision_schedule_nondivisor_intervals_capture",
     test_collision_schedule_nondivisor_intervals,
-    devices=get_cuda_test_devices(),
+    devices=get_conditional_graph_test_devices(),
     external_capture=True,
 )
 
