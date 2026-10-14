@@ -10,7 +10,7 @@ import numpy as np
 import warp as wp
 
 from ..core.types import MAXVAL, Axis, Devicelike
-from ..utils.device import is_gpu
+from ..utils.device import is_gpu, is_metal, supports_texture_sdf
 from .kernels import sdf_box, sdf_capsule, sdf_cone, sdf_cylinder, sdf_ellipsoid, sdf_sphere
 from .sdf_mc import (
     MC_DEGENERATE_N_SQ_EPS,
@@ -38,6 +38,12 @@ def _resolve_paired_samples_flag(paired_samples: bool, device: wp.DeviceLike | N
         toolkit_version = wp.get_cuda_toolkit_version()
         return toolkit_version is not None and toolkit_version >= (13, 1)
     return bool(paired_samples)
+
+
+def _metal_texture_sdf_device(device: wp.DeviceLike | None) -> bool:
+    """Return whether ``device`` (or the current device) is a Metal device that builds texture SDFs."""
+    device = wp.get_device(device)
+    return is_metal(device) and supports_texture_sdf(device)
 
 
 if TYPE_CHECKING:
@@ -454,7 +460,7 @@ class SDF:
             ValueError: if ``texture_format`` or ``sign_method`` is not one of
                 the supported values.
         """
-        if not wp.is_cuda_available():
+        if not wp.is_cuda_available() and not _metal_texture_sdf_device(device):
             raise RuntimeError(
                 "SDF.create_from_mesh requires a CUDA device: the texture SDF "
                 "build pipeline uses CUDA kernels and wp.Texture3D. "
@@ -948,7 +954,7 @@ def _compute_sdf_from_shape_impl(
     Raises:
         RuntimeError: If CUDA is not available.
     """
-    if not wp.is_cuda_available():
+    if not wp.is_cuda_available() and not _metal_texture_sdf_device(device):
         raise RuntimeError("compute_sdf_from_shape requires CUDA but no CUDA device is available")
 
     if shape_type == GeoType.PLANE or shape_type == GeoType.HFIELD:

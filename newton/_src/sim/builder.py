@@ -74,6 +74,7 @@ from ..math import quat_between_vectors_robust
 from ..usd.schema_resolver import SchemaResolver
 from ..utils import compute_world_offsets
 from ..utils.deprecation import RemovedAttribute
+from ..utils.device import is_metal, supports_texture_sdf
 from ..utils.mesh import MeshAdjacency, split_mesh_components
 from .enums import (
     BodyFlags,
@@ -14236,8 +14237,10 @@ class ModelBuilder:
             # ---------------------
             # Compute and compact texture SDF resources (shared table + per-shape index indirection)
             # Texture SDFs need wp.Volume.allocate_by_tiles and wp.Texture3D,
-            # which only CUDA provides (Metal and CPU lack them).
-            supports_texture_sdf = current_device.is_cuda
+            # which CUDA and Metal builds of Warp that implement them provide.
+            texture_sdf_supported = current_device.is_cuda or (
+                is_metal(current_device) and supports_texture_sdf(current_device)
+            )
 
             has_mesh_sdf = any(
                 stype in (GeoType.MESH, GeoType.CONVEX_MESH)
@@ -14267,11 +14270,12 @@ class ModelBuilder:
                 (sflags & ShapeFlags.HYDROELASTIC) and (sflags & ShapeFlags.COLLIDE_SHAPES)
                 for sflags in shape_flags_list
             )
-            if (has_mesh_sdf or has_deferred_mesh_sdf or has_hydroelastic_shapes) and not supports_texture_sdf:
+            if (has_mesh_sdf or has_deferred_mesh_sdf or has_hydroelastic_shapes) and not texture_sdf_supported:
                 raise ValueError(
                     "Building texture SDFs requires a CUDA-capable GPU device "
                     f"(got {current_device}). The texture SDF build path uses "
-                    "wp.Volume.allocate_by_tiles and wp.Texture3D, which are CUDA-only."
+                    "wp.Volume.allocate_by_tiles and wp.Texture3D, which are CUDA-only "
+                    "(or Metal, on Warp builds that implement them)."
                 )
 
             from ..geometry.sdf_texture import (  # noqa: PLC0415

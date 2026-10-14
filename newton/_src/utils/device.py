@@ -19,6 +19,7 @@ Warp builds without a Metal backend.
 from __future__ import annotations
 
 import contextlib
+import functools
 
 import warp as wp
 
@@ -34,6 +35,7 @@ __all__ = [
     "supports_cooperative_blocks",
     "supports_graph_capture",
     "supports_streams",
+    "supports_texture_sdf",
 ]
 
 
@@ -130,6 +132,42 @@ def supports_cooperative_blocks(device: wp.DeviceLike = None) -> bool:
     and tile shapes must be sized for one lane per block there.
     """
     return wp.get_device(device).is_cuda
+
+
+def supports_texture_sdf(device: wp.DeviceLike = None) -> bool:
+    """Return whether Newton can build texture SDFs on ``device``.
+
+    The texture SDF pipeline needs :class:`warp.Texture3D`,
+    :meth:`warp.Volume.allocate_by_tiles`, and winding-number mesh queries.
+    CUDA provides all of them. On Metal, a one-time probe checks that this
+    Warp build implements them. CPU devices return ``False``.
+    """
+    device = wp.get_device(device)
+    if device.is_cuda:
+        return True
+    if is_metal(device):
+        return _probe_metal_texture_sdf(device.alias)
+    return False
+
+
+@functools.cache
+def _probe_metal_texture_sdf(alias: str) -> bool:
+    """Allocate a tiny texture, sparse volume, and winding-number mesh on Metal."""
+    import numpy as np  # noqa: PLC0415
+
+    try:
+        with wp.ScopedDevice(alias):
+            wp.Texture3D(np.zeros((2, 2, 2), dtype=np.float32), device=alias)
+            wp.Volume.allocate_by_tiles(
+                wp.array([wp.vec3i(0, 0, 0)], dtype=wp.vec3i, device=alias), voxel_size=1.0, device=alias
+            )
+            corners = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [0.0, 0.0, 0.0]]
+            points = wp.array(np.array(corners, dtype=np.float32), dtype=wp.vec3, device=alias)
+            indices = wp.array([0, 1, 2, 0, 2, 3, 0, 3, 1, 1, 3, 2], dtype=wp.int32, device=alias)
+            wp.Mesh(points=points, indices=indices, support_winding_number=True)
+    except Exception:
+        return False
+    return True
 
 
 def is_capturing(device: wp.DeviceLike = None) -> bool:
