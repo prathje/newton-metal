@@ -220,6 +220,19 @@ class SolverKaminoImpl(SolverBase):
         linear_solver_kwargs = dict(self._config.dynamics.linear_solver_kwargs)
         if not self._config.padmm.use_graph_conditionals and issubclass(linear_solver_type, IterativeSolver):
             linear_solver_kwargs.setdefault("use_graph_conditionals", False)
+        elif (
+            is_metal(device)
+            and self._config.dynamics_solver == "padmm"
+            and issubclass(linear_solver_type, IterativeSolver)
+        ):
+            # Metal replays a captured capture_while by unrolling its body to the
+            # loop's budget, and gates nested inside a skipped outer iteration
+            # still run, so an inner CG/CR loop nested in PADMM's loop costs
+            # (PADMM budget) x (CG/CR budget) gates per replay. Unrolling the
+            # inner loop instead (results are identical) measured 4x faster
+            # (24 -> 6 ms) when PADMM exits early and on par when it runs to
+            # its iteration limit, so keep only PADMM's loop conditional.
+            linear_solver_kwargs.setdefault("use_graph_conditionals", False)
 
         # Bundle both constraint stabilization and forward-
         # dynamics problem configurations into a single object
