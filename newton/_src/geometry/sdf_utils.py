@@ -464,7 +464,7 @@ class SDF:
             raise RuntimeError(
                 "SDF.create_from_mesh requires a CUDA device: the texture SDF "
                 "build pipeline uses CUDA kernels and wp.Texture3D. "
-                "No CUDA-capable device was detected."
+                "No CUDA-capable device (or Metal device with texture/volume support) was detected."
             )
 
         valid_sign_methods: tuple[SignMethod, ...] = ("auto", "parity", "winding", "normal")
@@ -955,7 +955,10 @@ def _compute_sdf_from_shape_impl(
         RuntimeError: If CUDA is not available.
     """
     if not wp.is_cuda_available() and not _metal_texture_sdf_device(device):
-        raise RuntimeError("compute_sdf_from_shape requires CUDA but no CUDA device is available")
+        raise RuntimeError(
+            "compute_sdf_from_shape requires CUDA but no CUDA device "
+            "(or Metal device with texture/volume support) is available"
+        )
 
     if shape_type == GeoType.PLANE or shape_type == GeoType.HFIELD:
         # SDF collisions are not supported for Plane or HField shapes, falling back to mesh collisions

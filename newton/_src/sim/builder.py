@@ -14175,10 +14175,9 @@ class ModelBuilder:
             )
             if (has_mesh_sdf or has_deferred_mesh_sdf or has_hydroelastic_shapes) and not texture_sdf_supported:
                 raise ValueError(
-                    "Building texture SDFs requires a CUDA-capable GPU device "
-                    f"(got {current_device}). The texture SDF build path uses "
-                    "wp.Volume.allocate_by_tiles and wp.Texture3D, which are CUDA-only "
-                    "(or Metal, on Warp builds that implement them)."
+                    "Building texture SDFs requires a CUDA-capable GPU device or a Metal device with "
+                    f"texture/volume support (got {current_device}). The texture SDF build path uses "
+                    "wp.Volume.allocate_by_tiles and wp.Texture3D."
                 )
 
             from ..geometry.sdf_texture import (  # noqa: PLC0415
