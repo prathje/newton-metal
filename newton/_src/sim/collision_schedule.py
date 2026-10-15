@@ -122,6 +122,15 @@ def _update_collision_schedule(
 
 
 @wp.kernel(enable_backward=False)
+def _any_interval_selected(interval_conditions: wp.array[wp.int32], start: int, selected: wp.array[wp.int32]):
+    """Set ``selected[0]`` when any interval from ``start`` on is selected."""
+    any_selected = int(0)
+    for interval_index in range(start, interval_conditions.shape[0]):
+        any_selected = any_selected | interval_conditions[interval_index]
+    selected[0] = any_selected
+
+
+@wp.kernel(enable_backward=False)
 def _check_final_substep(
     max_point_speed: wp.array[wp.float32],
     previous_max_point_speed: wp.array[wp.float32],
@@ -282,6 +291,9 @@ class CollisionSubstepScheduler:
             self._interval_conditions[index : index + 1] for index in range(len(self._collision_intervals))
         ]
         self._collision_due = wp.zeros(1, dtype=wp.int32, device=device)
+        # Selection flag for the intervals that reach the frame boundary,
+        # used only by the flat dispatch recorded on Metal.
+        self._flat_tail_condition = wp.zeros(1, dtype=wp.int32, device=device) if is_metal(device) else None
         self._collision_deadline = wp.zeros(1, dtype=wp.int32, device=device)
         self._max_point_speed = wp.zeros(1, dtype=wp.float32, device=device)
         self._previous_shape_velocity = wp.zeros(model.shape_count, dtype=wp.spatial_vector, device=device)
@@ -332,11 +344,24 @@ class CollisionSubstepScheduler:
         remaining = self._substeps - substep_index
         state = self._states[substep_index % 2]
         for interval_index, interval in enumerate(self._collision_intervals):
+            condition = self._interval_condition_views[interval_index]
+            if interval >= remaining:
+                # This and every longer interval refresh up to the frame
+                # boundary, so one branch covers the rest of the selection.
+                wp.launch(
+                    _any_interval_selected,
+                    dim=1,
+                    inputs=[self._interval_conditions, interval_index, self._flat_tail_condition],
+                    device=self._model.device,
+                )
+                condition = self._flat_tail_condition
             collision_dt = min(interval, remaining) * self._substep_dt
             wp.capture_if(
-                self._interval_condition_views[interval_index],
+                condition,
                 on_true=lambda collision_dt=collision_dt: self._collision_callback(state, collision_dt),
             )
+            if interval >= remaining:
+                break
 
     def step(self) -> None:
         """Execute or record one complete fixed-substep frame."""
