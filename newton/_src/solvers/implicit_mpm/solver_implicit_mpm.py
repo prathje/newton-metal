@@ -3549,7 +3549,13 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
                 has_colliders=self._mpm_model.collider.collider_mesh.shape[0] > 0,
             )
 
-            # Retain graph to avoid immediate CPU sync
+            # Retain graph to avoid immediate CPU sync. On Metal, recording a
+            # graph for every eager solve costs more than it saves (an eager
+            # step measured 181 ms with the graph vs 38 ms without), so use
+            # the conditional graph path only inside an outer capture there.
+            use_graph = self._use_cuda_graph
+            if use_graph and is_metal(self.model.device) and not is_capturing(self.model.device):
+                use_graph = False
             solve_graph = solve_rheology(
                 self.solver,
                 self.max_iterations,
@@ -3558,7 +3564,7 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
                 rheology_data,
                 collision_data,
                 temporary_store=self.temporary_store,
-                use_graph=self._use_cuda_graph,
+                use_graph=use_graph,
                 verbose=self.verbose,
             )
 
