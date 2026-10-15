@@ -228,6 +228,10 @@ def add_example_test(
                 argv = ["--device", str(device), "--test", "--quiet"]
                 for entry in newton.tests.unittest_utils.warp_config_overrides:
                     argv.extend(["--warp-config", entry])
+                if is_gpu and not is_cuda and hasattr(wp.config, "metal_print"):
+                    # Metal compiles wp.print()/printf() out and warns about it on
+                    # stderr, which the output check would reject.
+                    argv.extend(["--warp-config", "metal_print=ignore"])
                 stage_path = None
                 if use_viewer:
                     argv.extend(["--viewer", "null"])
