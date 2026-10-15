@@ -11,6 +11,7 @@ import warp as wp
 import newton
 
 from ..geometry import raycast
+from ..utils.device import is_gpu
 from .kernels import PickingState, apply_picking_force_kernel, compute_pick_state_kernel, update_pick_target_kernel
 
 
@@ -67,6 +68,10 @@ class Picking:
         # picking state
         if model and model.device.is_cuda:
             self.pick_body = wp.array([-1], dtype=int, pinned=True, device=model.device)
+        elif model and is_gpu(model.device):
+            # Metal kernels write pick_body, so it must live on the device
+            # (shared storage keeps host reads cheap).
+            self.pick_body = wp.array([-1], dtype=int, device=model.device)
         else:
             self.pick_body = wp.array([-1], dtype=int, device="cpu")
 
