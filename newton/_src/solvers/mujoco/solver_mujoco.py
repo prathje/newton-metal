@@ -12,7 +12,7 @@ import sys
 import warnings
 from array import array
 from collections.abc import Iterable
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from dataclasses import dataclass, fields
 from enum import IntEnum, IntFlag
 from typing import TYPE_CHECKING, Any
@@ -4869,10 +4869,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         """Prepare and apply all solver-local MJWarp compilation options."""
         self._apply_module_options()
         self._prepare_generated_kernels()
-        loop_budget = (
-            capture_while_budget(self.device, self._capture_while_bound()) if is_metal(self.device) else nullcontext()
-        )
-        with self._scoped_deterministic_config(), loop_budget:
+        with self._scoped_deterministic_config(), capture_while_budget(self.device, self._capture_while_bound()):
             yield
 
     def _capture_while_bound(self) -> int:
