@@ -55,6 +55,20 @@ HAS_NATIVE_TILE_MATMUL_LEFT_TRANSPOSE_UPDATE = (
 )
 
 
+def use_native_tile_matmul_left_transpose_update() -> bool:
+    """Return whether kernels built now should use the native transpose-update snippet.
+
+    The snippet takes tile arguments, which Warp's Metal backend cannot pass
+    to native snippets. Kernels are shared across devices, so when Warp has
+    registered a Metal device this returns ``False`` and every device uses
+    the pure-Warp fallback, as with ``NEWTON_KAMINO_DISABLE_TILE_TRANSPOSE_UPDATE=1``.
+    Processes without a Metal device are unaffected.
+    """
+    if not HAS_NATIVE_TILE_MATMUL_LEFT_TRANSPOSE_UPDATE:
+        return False
+    return not any(getattr(device, "is_metal", False) for device in wp.get_devices())
+
+
 @cache
 def make_tile_matmul_left_transpose_update_func(block_size: int):
     """Create ``out += alpha * transpose(left) @ right`` for the LLT solve."""
