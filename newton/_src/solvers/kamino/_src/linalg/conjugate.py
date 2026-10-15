@@ -14,7 +14,7 @@ from typing import Any, Generic
 
 import warp as wp
 
-from .....utils.device import capture_while_budget, check_conditional_capture, is_capturing
+from .....utils.device import capture_while_budget, check_conditional_capture, is_capturing, is_metal
 from . import blas
 from .core import DenseLinearOperatorData
 from .sparse_matrix import BlockSparseMatrices
@@ -201,6 +201,24 @@ class BatchedLinearOperator(Generic[ScalarType, IndexType]):
 
 # Implementations
 # ---------------
+
+
+@wp.kernel
+def _copy_vector_kernel(src: wp.array[Any], dst: wp.array[Any]):
+    i = wp.tid()
+    dst[i] = src[i]
+
+
+def _assign_vector(dst: wp.array, src: wp.array) -> None:
+    """Copy ``src`` into ``dst``, with a kernel for strided Metal views.
+
+    Metal graph capture cannot record strided ``wp.copy`` transfers, and the
+    non-tiled dot-product buffers are strided views.
+    """
+    if is_metal(dst.device) and not (dst.is_contiguous and src.is_contiguous):
+        wp.launch(_copy_vector_kernel, dim=dst.shape[0], inputs=[src, dst], device=dst.device)
+    else:
+        dst.assign(src)
 
 
 @wp.kernel
@@ -769,7 +787,7 @@ class CGSolver(ConjugateSolver[ScalarType, IndexType]):
         )
 
     def do_iteration(self, p, Ap, rz_old, rz_new, z, x, r, r_norm_sq, active_dims, world_active):
-        rz_old.assign(rz_new)
+        _assign_vector(rz_old, rz_new)
 
         # Ap = A * p
         self.A.matvec(p, Ap, world_active)
@@ -903,7 +921,7 @@ class CRSolver(ConjugateSolver[ScalarType, IndexType]):
         )
 
     def do_iteration(self, p, Ap, Az, zAz_old, zAz_new, z, y, x, r, r_copy, r_norm_sq, active_dims, world_active):
-        zAz_old.assign(zAz_new)
+        _assign_vector(zAz_old, zAz_new)
 
         if self.Mi is not None:
             self.Mi.matvec(Ap, y, world_active)
