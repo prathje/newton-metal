@@ -32,8 +32,8 @@ __all__ = [
     "check_conditional_capture",
     "is_capturing",
     "is_gpu",
+    "is_graph_capture_allocation_enabled",
     "is_metal",
-    "supports_capture_allocation",
     "supports_conditional_graphs",
     "supports_cooperative_blocks",
     "supports_graph_capture",
@@ -101,14 +101,26 @@ def supports_conditional_graphs(device: wp.DeviceLike = None) -> bool:
     return False
 
 
-def supports_capture_allocation(device: wp.DeviceLike = None) -> bool:
-    """Return whether allocating device memory during a graph capture is safe on ``device``.
+def is_graph_capture_allocation_enabled(device: wp.DeviceLike = None) -> bool:
+    """Whether device allocation during graph capture is safe on ``device``.
 
-    CUDA needs its stream-ordered memory pool so that allocations become
-    graph memory nodes. Metal builds that record conditional work also keep
-    every buffer a captured command references alive for the graph's
-    lifetime and record the fills of new arrays, which matches CUDA's
-    semantics. CPU allocation is always safe.
+    CUDA needs its stream-ordered memory pool active so that
+    ``cudaMallocAsync`` can be captured as a memory-alloc node in the graph;
+    for CPU the concept does not apply -- plain host allocation is always
+    safe during CPU graph capture -- so this always returns ``True`` for CPU
+    devices. Metal devices have no memory pool; Metal builds of Warp that
+    record conditional work keep every buffer a captured command references
+    alive for the graph's lifetime and record the fills of new arrays, which
+    matches CUDA's semantics, so they report ``True``; older builds report
+    ``False``. Solvers that grow internal buffers on demand should call this
+    before raising a "cannot allocate during capture" error.
+
+    Args:
+        device: A Warp device or device identifier.
+
+    Returns:
+        ``True`` if allocation during graph capture is currently safe on
+        ``device``; ``False`` otherwise.
     """
     device = wp.get_device(device)
     if device.is_cpu:

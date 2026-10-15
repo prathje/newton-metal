@@ -40,7 +40,7 @@ def supports_graph_capture(
             captured buffers alive across replays).
     """
     from newton._src.utils.device import (  # noqa: PLC0415
-        supports_capture_allocation,
+        is_graph_capture_allocation_enabled,
         supports_conditional_graphs,
     )
     from newton._src.utils.device import supports_graph_capture as _supports_graph_capture  # noqa: PLC0415
@@ -49,7 +49,7 @@ def supports_graph_capture(
         return False
     if conditional and not supports_conditional_graphs(device):
         return False
-    return not allocation or supports_capture_allocation(device)
+    return not allocation or is_graph_capture_allocation_enabled(device)
 
 
 def get_source_directory() -> str:

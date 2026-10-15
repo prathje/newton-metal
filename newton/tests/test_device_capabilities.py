@@ -17,7 +17,6 @@ from newton._src.utils.device import (
     check_conditional_capture,
     is_capturing,
     is_metal,
-    supports_capture_allocation,
     supports_conditional_graphs,
     supports_graph_capture,
 )
@@ -47,7 +46,6 @@ def test_cpu_capabilities(test, device):
     test.assertFalse(is_capturing(device))
     test.assertIsNone(active_capture_key(device))
     test.assertIsInstance(capture_while_budget(device, 7), contextlib.nullcontext)
-    test.assertTrue(supports_capture_allocation(device))
     test.assertTrue(is_graph_capture_allocation_enabled(device))
     # Outside a Metal capture the check never raises.
     check_conditional_capture(device, "test")
@@ -110,9 +108,7 @@ def test_metal_conditional_capture(test, device):
 
 def test_metal_capture_allocation(test, device):
     """Arrays allocated during a Metal capture behave like CUDA graph allocations."""
-    supported = supports_capture_allocation(device)
-    test.assertEqual(is_graph_capture_allocation_enabled(device), supported)
-    if not supported:
+    if not is_graph_capture_allocation_enabled(device):
         return
 
     n = 1024

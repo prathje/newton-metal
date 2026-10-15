@@ -7,7 +7,7 @@ import numpy as np
 import warp as wp
 
 from ..core.types import Axis
-from .device import is_metal, supports_capture_allocation
+from .device import is_graph_capture_allocation_enabled
 from .download_assets import clear_git_cache, download_asset
 from .texture import load_texture, normalize_texture
 from .topology import topological_sort, topological_sort_undirected
@@ -21,33 +21,6 @@ def check_conditional_graph_support():
         bool: True if conditional graph support is available, False otherwise.
     """
     return wp.is_conditional_graph_supported()
-
-
-def is_graph_capture_allocation_enabled(device) -> bool:
-    """Whether device allocation during graph capture is safe on ``device``.
-
-    CUDA needs its stream-ordered memory pool active so that
-    ``cudaMallocAsync`` can be captured as a memory-alloc node in the graph;
-    for CPU the concept does not apply -- plain host allocation is always
-    safe during CPU graph capture -- so this always returns ``True`` for CPU
-    devices. Metal devices have no memory pool; they report ``True`` when
-    Warp's Metal backend keeps captured buffers alive across replays and
-    ``False`` otherwise. Solvers that grow internal buffers on demand should
-    call this before raising a "cannot allocate during capture" error.
-
-    Args:
-        device: A Warp device or device identifier.
-
-    Returns:
-        ``True`` if allocation during graph capture is currently safe on
-        ``device``; ``False`` otherwise.
-    """
-    device = wp.get_device(device)
-    if device.is_cpu:
-        return True
-    if is_metal(device):
-        return supports_capture_allocation(device)
-    return device.is_mempool_enabled
 
 
 def compute_world_offsets(world_count: int, spacing: tuple[float, float, float], up_axis: Any = None):
