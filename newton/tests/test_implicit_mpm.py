@@ -2032,10 +2032,8 @@ def test_cg_rheology_whole_step_graph_capture(test, device):
     device-side results back. The scene has no colliders so ``solver="cg"`` is
     admissible.
     """
-    if not device.is_cuda and not supports_conditional_graphs(device):
-        test.skipTest("whole-step graph capture requires a CUDA device")
     if not supports_conditional_graphs(device):
-        test.skipTest("whole-step graph capture requires conditional CUDA graph support")
+        test.skipTest("whole-step graph capture requires conditional graph support")
 
     voxel_size = 0.1
     emit_lo = np.array([-0.15, -0.15, 0.1])
