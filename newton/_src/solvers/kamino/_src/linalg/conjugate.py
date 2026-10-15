@@ -7,6 +7,7 @@ KAMINO: Conjugate gradient and conjugate residual solvers
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import math
 from collections.abc import Callable
@@ -408,8 +409,11 @@ def _run_capturable_loop(
             check_conditional_capture(device, "Kamino's iterative linear solver")
             # Metal unrolls captured loops; one cycle per loop_granularity
             # iterations, plus the cycle that observes termination.
-            max_cycles = -(-int(maxiter_host) // loop_granularity) + 1 if maxiter_host is not None else 1
-            with capture_while_budget(device, max_cycles):
+            if maxiter_host is None:
+                loop_budget = contextlib.nullcontext()
+            else:
+                loop_budget = capture_while_budget(device, -(-int(maxiter_host) // loop_granularity) + 1)
+            with loop_budget:
                 wp.capture_while(global_condition, do_cycle_with_condition)
         else:
             for _ in range(0, int(maxiter_host), loop_granularity):
