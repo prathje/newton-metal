@@ -9,10 +9,10 @@ import warp as wp
 
 from ._array_ptr import get_float32_array_offset_ptr
 from ._tile_builtins import (
-    HAS_NATIVE_TILE_MATMUL_LEFT_TRANSPOSE_UPDATE,
     HAS_TILE_MATMUL_LEFT_TRANSPOSE_UPDATE,
     HAS_TILE_MATMUL_TRANSPOSE_UPDATE,
     make_tile_matmul_left_transpose_update_func,
+    use_native_tile_matmul_left_transpose_update,
 )
 
 ###
@@ -308,7 +308,7 @@ def make_llt_blocked_solve_func(block_size: int):
                     x_tile = wp.tile_load(x_i, shape=(block_size, 1), offset=(j, 0))
                     if wp.static(HAS_TILE_MATMUL_LEFT_TRANSPOSE_UPDATE):
                         wp.tile_matmul_left_transpose_update(rhs_tile, L_tile, x_tile, alpha=-1.0)
-                    elif wp.static(HAS_NATIVE_TILE_MATMUL_LEFT_TRANSPOSE_UPDATE):
+                    elif wp.static(use_native_tile_matmul_left_transpose_update()):
                         wp.static(make_tile_matmul_left_transpose_update_func(block_size))(
                             rhs_tile, L_tile, x_tile, -1.0
                         )
