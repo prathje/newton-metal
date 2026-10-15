@@ -209,6 +209,8 @@ class TestLinalgConjugate(unittest.TestCase):
                 cap_cur, _, _ = solver.solve(problem.b_wp, x_capture)
         except (NotImplementedError, RuntimeError) as e:
             # Metal raises RuntimeError for the same strided-copy limitation.
+            if not isinstance(e, NotImplementedError) and not getattr(device, "is_metal", False):
+                raise
             if "non-contiguous" not in str(e):
                 raise
             self.skipTest(f"Warp graph capture limitation on {device}: {e}")
