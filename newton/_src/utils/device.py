@@ -20,8 +20,11 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import logging
 
 import warp as wp
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "active_capture_key",
@@ -166,6 +169,9 @@ def _probe_metal_texture_sdf(alias: str) -> bool:
             indices = wp.array([0, 1, 2, 0, 2, 3, 0, 3, 1, 1, 3, 2], dtype=wp.int32, device=alias)
             wp.Mesh(points=points, indices=indices, support_winding_number=True)
     except Exception:
+        # Any failure means this Warp build cannot run the pipeline on Metal;
+        # keep the reason for users debugging a missing texture SDF path.
+        logger.debug("Texture SDF probe failed on %s; texture SDFs are unavailable there.", alias, exc_info=True)
         return False
     return True
 
