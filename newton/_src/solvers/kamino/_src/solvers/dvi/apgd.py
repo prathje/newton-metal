@@ -113,7 +113,7 @@ early termination. There is no fixed-loop fallback.
 
 import warp as wp
 
-from ......utils.device import capture_while_budget, check_conditional_capture
+from ......utils.device import capture_while_budget, check_conditional_capture, is_metal
 from . import apgd_kernels as kernels
 
 
@@ -140,6 +140,8 @@ class UnilateralAPGD:
         """
         self.owner = owner
         self.device = owner.device
+        if is_metal(self.device):
+            kernels.use_metal_fp64_emulation()
         if self.device.is_cuda and not wp.is_conditional_graph_supported():
             raise RuntimeError(
                 "CUDA APGD requires conditional graphs: a Warp build and CUDA driver supporting CUDA 12.4+."
