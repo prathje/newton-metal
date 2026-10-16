@@ -16,6 +16,19 @@ from .types import DVIConfigStruct, DVIStatus
 wp.set_module_options({"enable_backward": False})
 
 
+def use_metal_fp64_emulation():
+    """Give this module's ``float64`` locals real double precision on Metal.
+
+    The natural-map residual, curvature, and restart tests below evaluate in
+    ``float64`` to avoid cancellation at large impulses. Apple GPUs have no
+    fp64, and Warp's Metal backend computes ``float64`` locals in ``float32``
+    unless a module opts into software fp64. Called when an APGD solver is
+    created on a Metal device; CPU and CUDA processes never set the option.
+    """
+    if wp.get_module_options(__name__).get("metal_fp64") != "emulate":
+        wp.set_module_options({"metal_fp64": "emulate"}, __name__)
+
+
 @wp.struct
 class APGDConfig:
     """Per-world budgets and tolerances for the nested solve."""
