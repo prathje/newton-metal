@@ -53,6 +53,7 @@ __all__ = [
     "_compute_complementarity_residuals",
     "_compute_desaxce_correction",
     "_compute_final_desaxce_correction",
+    "_compute_infnorm_residuals_serial",
     "_compute_projection_argument",
     "_compute_solution_vectors",
     "_compute_velocity_bias",
@@ -1368,6 +1369,74 @@ def _make_compute_infnorm_residuals_kernel(tile_size: int, n_cts_max: int, n_com
             solver_penalty[wid] = _update_penalty(config, solver_penalty[wid], status.iterations, r_p_max, r_d_max)
 
     return _compute_infnorm_residuals
+
+
+@wp.kernel(module="unique", module_options={"enable_backward": False})
+def _compute_infnorm_residuals_serial(
+    # Inputs:
+    problem_nbc: wp.array[wp.int32],
+    problem_nl: wp.array[wp.int32],
+    problem_nc: wp.array[wp.int32],
+    problem_iio: wp.array[wp.int32],
+    problem_dim: wp.array[wp.int32],
+    problem_vio: wp.array[wp.int32],
+    solver_config: wp.array[PADMMConfigStruct],
+    solver_r_p: wp.array[wp.float32],
+    solver_r_d: wp.array[wp.float32],
+    solver_r_c: wp.array[wp.float32],
+    # Outputs:
+    solver_state_done: wp.array[wp.int32],
+    solver_status: wp.array[PADMMStatus],
+    solver_penalty: wp.array[PADMMPenalty],
+    linear_solver_atol: wp.array[wp.float32],
+):
+    """One-thread-per-world form of ``_make_compute_infnorm_residuals_kernel``.
+
+    Used on Metal, where tile kernels run one thread per block with every tile
+    in private memory: the tiled form holds about fifteen ``tile_size`` tiles
+    (up to 2048 elements each) per thread, more than the Apple GPU compiler
+    accepts. The infinity norms are maxima of absolute values, so a serial
+    sweep gives the same values as the tile reductions.
+    """
+    wid = wp.tid()
+    status = solver_status[wid]
+    if status.converged:
+        return
+    status.iterations += 1
+
+    nbc = problem_nbc[wid]
+    nl = problem_nl[wid]
+    nc = problem_nc[wid]
+    ncts = problem_dim[wid]
+    config = solver_config[wid]
+    vio = problem_vio[wid]
+    iio = problem_iio[wid]
+
+    r_p_max = wp.float32(0.0)
+    r_d_max = wp.float32(0.0)
+    for i in range(ncts):
+        r_p_max = wp.max(r_p_max, wp.abs(solver_r_p[vio + i]))
+        r_d_max = wp.max(r_d_max, wp.abs(solver_r_d[vio + i]))
+    r_c_max = wp.float32(0.0)
+    for i in range(nbc + nl + nc):
+        r_c_max = wp.max(r_c_max, wp.abs(solver_r_c[iio + i]))
+
+    status.r_p = r_p_max
+    status.r_d = r_d_max
+    status.r_c = r_c_max
+    if linear_solver_atol and config.linear_solver_tolerance_ratio > 0.0:
+        linear_solver_atol[wid] = wp.max(config.linear_solver_tolerance_ratio * r_p_max, FLOAT32_EPS)
+    if (
+        status.iterations > 1
+        and r_p_max <= config.primal_tolerance
+        and r_d_max <= config.dual_tolerance
+        and r_c_max <= config.compl_tolerance
+    ):
+        status.converged = 1
+    if status.converged or status.iterations >= config.max_iterations:
+        solver_state_done[0] -= 1
+    solver_status[wid] = status
+    solver_penalty[wid] = _update_penalty(config, solver_penalty[wid], status.iterations, r_p_max, r_d_max)
 
 
 def make_collect_solver_info_kernel(use_acceleration: bool):

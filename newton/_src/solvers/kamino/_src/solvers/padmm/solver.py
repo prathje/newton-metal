@@ -29,6 +29,7 @@ from .kernels import (
     _compute_complementarity_residuals,
     _compute_desaxce_correction,
     _compute_final_desaxce_correction,
+    _compute_infnorm_residuals_serial,
     _compute_projection_argument,
     _compute_solution_vectors,
     _compute_velocity_bias,
@@ -1235,6 +1236,29 @@ class PADMMSolver:
             problem: The dual forward dynamics problem to be solved.
         """
         # Compute infinity-norm of all residuals and check for convergence
+        inputs = [
+            # Inputs:
+            problem.data.nbc,
+            problem.data.nl,
+            problem.data.nc,
+            problem.data.iio,
+            problem.data.dim,
+            problem.data.vio,
+            self._data.config,
+            self._data.residuals.r_primal,
+            self._data.residuals.r_dual,
+            self._data.residuals.r_compl,
+            # Outputs:
+            self._data.state.done,
+            self._data.status,
+            self._data.penalty,
+            self._data.linear_solver_atol,
+        ]
+        if is_metal(self.device):
+            # Metal holds every tile in per-thread private memory; the tiled
+            # reduction exceeds what its compiler accepts at large tile sizes.
+            wp.launch(_compute_infnorm_residuals_serial, dim=self._size.num_worlds, inputs=inputs, device=self.device)
+            return
         tile_size = get_tile_size(self._size.max_of_max_total_cts)
         block_dim = get_block_dim(tile_size, min_size=1)
         wp.launch_tiled(
@@ -1245,24 +1269,7 @@ class PADMMSolver:
             ),
             dim=self._size.num_worlds,
             block_dim=block_dim,
-            inputs=[
-                # Inputs:
-                problem.data.nbc,
-                problem.data.nl,
-                problem.data.nc,
-                problem.data.iio,
-                problem.data.dim,
-                problem.data.vio,
-                self._data.config,
-                self._data.residuals.r_primal,
-                self._data.residuals.r_dual,
-                self._data.residuals.r_compl,
-                # Outputs:
-                self._data.state.done,
-                self._data.status,
-                self._data.penalty,
-                self._data.linear_solver_atol,
-            ],
+            inputs=inputs,
             device=self.device,
         )
 
