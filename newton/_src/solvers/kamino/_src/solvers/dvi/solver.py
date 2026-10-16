@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import warp as wp
 
+from ......utils.device import is_metal
 from ....config import DVISolverConfig
 from ...core.data import DataKamino
 from ...core.model import ModelKamino
@@ -335,7 +336,10 @@ class DVISolver:
         if solver_type == "LLTB":
             # A larger factorization tile reduces panel count, while the
             # single-RHS solve benefits from more threads on its smaller tile.
-            kwargs.setdefault("factorize_block_size", 64)
+            # Metal runs tile kernels one thread per block with every tile in
+            # private memory; a 64-wide factorization exceeds what the Apple
+            # GPU driver can execute from a captured graph, so use 32 there.
+            kwargs.setdefault("factorize_block_size", 32 if is_metal(self._device) else 64)
             kwargs.setdefault("solve_block_dim", 256)
             solver_class = LLTBlockedSolver
         else:
