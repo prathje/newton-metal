@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import warp as wp
 
-from ......utils.device import capture_while_budget, check_conditional_capture
+from ......utils.device import capture_while_budget, check_conditional_capture, is_metal
 from ....config import PADMMSolverConfig
 from ...core.data import DataKamino
 from ...core.model import ModelKamino
@@ -278,9 +278,21 @@ class PADMMSolver:
         self._update_dual_variables_and_compute_primal_dual_residuals_kernel = (
             make_update_dual_variables_and_compute_primal_dual_residuals(self._use_acceleration)
         )
-        tile_size = get_tile_size(self._size.max_of_max_total_cts)
-        block_dim = get_block_dim(tile_size, ratio=2, min_size=1)
+        block_dim = self._project_dual_convergence_accel_block_dim()
         self._project_dual_convergence_accel_kernel = _make_project_dual_convergence_accel_kernel(block_dim)
+
+    def _project_dual_convergence_accel_block_dim(self) -> int:
+        """Return the block size of the accelerated projection/update kernel.
+
+        On Metal the kernel runs one thread per block (``wp.block_dim() == 1``),
+        as on the CPU, and Warp rejects a lane-indexed tile scatter launched with
+        more lanes. Launching with one lane runs the same serial sweep the CPU
+        runs. CUDA and CPU keep the shared block size.
+        """
+        if is_metal(self._device):
+            return 1
+        tile_size = get_tile_size(self._size.max_of_max_total_cts)
+        return get_block_dim(tile_size, ratio=2, min_size=1)
 
     def reset(self, problem: DualProblem | None = None, world_mask: wp.array[wp.bool] | None = None):
         """
@@ -1154,8 +1166,7 @@ class PADMMSolver:
 
     def _update_projection_dual_convergence_accel(self, problem: DualProblem):
         """Advance accelerated PADMM projection, residual status, and state cache."""
-        tile_size = get_tile_size(self._size.max_of_max_total_cts)
-        block_dim = get_block_dim(tile_size, ratio=2, min_size=1)
+        block_dim = self._project_dual_convergence_accel_block_dim()
         wp.launch_tiled(
             kernel=self._project_dual_convergence_accel_kernel,
             dim=self._size.num_worlds,
