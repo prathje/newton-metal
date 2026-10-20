@@ -795,6 +795,26 @@ class DVISolver:
     def _can_use_dense_inequality_pgs(self) -> bool:
         return self._has_unilateral_constraints and self._size.sum_of_num_bilateral_joint_cts == 0
 
+    def _dense_pgs_kernel(self):
+        """Dense colored PGS kernel; Metal uses the row-owned variant (see ``kernels_metal``)."""
+        if is_metal(self.device):
+            from .kernels_metal import _solve_dvi_inequalities_colored_pgs_rows  # noqa: PLC0415
+
+            return _solve_dvi_inequalities_colored_pgs_rows
+        return _solve_dvi_inequalities_colored_pgs
+
+    def _dense_pgs_threads_per_world(self) -> int:
+        """Block width of the dense colored PGS kernel.
+
+        CUDA uses 64 threads per world; Metal one 32-lane SIMD group (Warp's
+        coop-block lowering: real barriers and SIMD reductions); CPU one lane.
+        """
+        if self.device.is_cuda:
+            return 64
+        if is_metal(self.device):
+            return 32
+        return 1
+
     def _solve_dense_inequality_pgs(self, problem: DualProblem) -> None:
         """Solve an inequality-only dense problem through the unified path."""
         state = self._data.state
@@ -823,11 +843,11 @@ class DVISolver:
             ],
             device=self.device,
         )
-        threads_per_world = 64 if self.device.is_cuda else 1
+        threads_per_world = self._dense_pgs_threads_per_world()
         # Inequality-only solves need no host work between PGS blocks.
         for block_iteration in (_FUSED_INEQUALITY_BLOCK,):
             wp.launch(
-                kernel=_solve_dvi_inequalities_colored_pgs,
+                kernel=self._dense_pgs_kernel(),
                 dim=self._size.num_worlds * threads_per_world,
                 inputs=[
                     problem.data.dim,
@@ -958,7 +978,7 @@ class DVISolver:
             device=self.device,
         )
         self._prepare_inequality_coloring(problem)
-        threads_per_world = 64 if self.device.is_cuda else 1
+        threads_per_world = self._dense_pgs_threads_per_world()
         for block_iteration in range(self._max_alternating_iterations):
             wp.launch(
                 kernel=_compute_dvi_unilateral_velocities,
@@ -979,7 +999,7 @@ class DVISolver:
                 device=self.device,
             )
             wp.launch(
-                kernel=_solve_dvi_inequalities_colored_pgs,
+                kernel=self._dense_pgs_kernel(),
                 dim=self._size.num_worlds * threads_per_world,
                 inputs=[
                     problem.data.dim,
@@ -1101,7 +1121,7 @@ class DVISolver:
         )
 
         self._prepare_inequality_coloring(problem)
-        threads_per_world = 64 if self.device.is_cuda else 1
+        threads_per_world = self._dense_pgs_threads_per_world()
         wp.launch(
             kernel=_compute_dvi_unilateral_velocities,
             dim=(self._size.num_worlds, self._size.max_of_max_total_cts),
@@ -1121,7 +1141,7 @@ class DVISolver:
             device=self.device,
         )
         wp.launch(
-            kernel=_solve_dvi_inequalities_colored_pgs,
+            kernel=self._dense_pgs_kernel(),
             dim=self._size.num_worlds * threads_per_world,
             inputs=[
                 problem.data.dim,

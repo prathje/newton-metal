@@ -8,6 +8,9 @@
 - The accelerated PADMM projection kernel runs with 32 lanes per world on Metal. With more constraint
   rows than lanes each lane handles several rows; the result must match a one-lane launch (the
   serial sweep the CPU runs) and the CPU solve.
+- The DVI dense colored PGS kernel runs with 32 lanes per world on Metal (row-owned velocity update,
+  ``dvi/kernels_metal.py``). On one problem it must reproduce the one-lane CUDA/CPU kernel bit for
+  bit, and match the CPU solve within tolerance.
 """
 
 import unittest
@@ -15,11 +18,20 @@ import unittest
 import numpy as np
 import warp as wp
 
+import newton
+import newton._src.solvers.kamino.config as kamino_config
+from newton._src.solvers.kamino._src.core.model import ModelKamino
+from newton._src.solvers.kamino._src.dynamics.dual import DualProblem
 from newton._src.solvers.kamino._src.linalg.core import DenseLinearOperatorData, DenseSquareMultiLinearInfo
 from newton._src.solvers.kamino._src.linalg.linear import LLTBlockedSolver
+from newton._src.solvers.kamino._src.solvers.common import WarmStartMode
+from newton._src.solvers.kamino._src.solvers.dvi import DVISolver
+from newton._src.solvers.kamino._src.solvers.dvi.kernels import _solve_dvi_inequalities_colored_pgs
 from newton._src.solvers.kamino._src.solvers.padmm import PADMMSolver, PADMMWarmStartMode
 from newton.tests.kamino import setup_tests, test_context
 from newton.tests.kamino.test_kamino_solvers_padmm import TestSetup
+from newton.tests.kamino.test_kamino_solvers_dvi import _build_five_box_stack
+from newton.tests.kamino.utils.make import make_containers, update_containers
 from newton.tests.kamino.utils.rand import RandomProblemLLT
 from newton.tests.utils import basics
 
@@ -77,6 +89,73 @@ def _padmm_solve(device, block_dim=None):
         PADMMSolver._project_dual_convergence_accel_block_dim = orig
 
 
+def _dvi_pgs_builders():
+    def stacks():
+        builder = newton.ModelBuilder()
+        builder.replicate(builder=_build_five_box_stack(), world_count=3)
+        return builder
+
+    return {"five_box_stacks": stacks, "fourbar_and_boxes": _padmm_builder}
+
+
+def _dvi_pgs_problem(device, builder_fn):
+    """A dense DVI problem with contacts (and, for the four-bar, bilateral joint rows)."""
+    model = ModelKamino.from_newton(builder_fn().finalize(device=device))
+    model, data, state, limits, detector, jacobians = make_containers(
+        model=model, max_world_contacts=64, sparse=False, dt=1.0e-3
+    )
+    update_containers(model, data, state, limits, detector, jacobians)
+    problem = DualProblem(
+        model=model,
+        data=data,
+        limits=limits,
+        contacts=detector.contacts,
+        jacobians=jacobians,
+        solver=LLTBlockedSolver,
+        sparse=False,
+    )
+    problem.build(model=model, data=data, limits=limits, contacts=detector.contacts, jacobians=jacobians)
+    solver = DVISolver(
+        model=model,
+        data=data,
+        limits=limits,
+        contacts=detector.contacts,
+        jacobians=jacobians,
+        config=kamino_config.DVISolverConfig(
+            unilateral_solver="pgs",
+            max_alternating_iterations=40,
+            inequality_sweeps_per_iteration=2,
+            tolerance=1e-6,
+            regularization=1e-6,
+        ),
+        warmstart=WarmStartMode.NONE,
+    )
+    return problem, solver
+
+
+def _dvi_pgs_solve(problem, solver, kernel=None, threads_per_world=None):
+    """Solve with an overridden dense PGS kernel / block width; returns (lambdas, v_aug, kernel launches)."""
+    launches = [0]
+    pick_kernel = solver._dense_pgs_kernel
+    chosen = kernel or pick_kernel()
+
+    def _kernel():
+        launches[0] += 1
+        return chosen
+
+    solver._dense_pgs_kernel = _kernel
+    if threads_per_world is not None:
+        solver._dense_pgs_threads_per_world = lambda: threads_per_world
+    try:
+        solver.reset()
+        solver.coldstart()
+        solver.solve(problem)
+        return solver.data.solution.lambdas.numpy(), solver.data.state.v_aug.numpy(), launches[0]
+    finally:
+        del solver._dense_pgs_kernel
+        solver.__dict__.pop("_dense_pgs_threads_per_world", None)
+
+
 class TestKaminoMetalLanes(unittest.TestCase):
     def setUp(self):
         if not test_context.setup_done:
@@ -111,6 +190,33 @@ class TestKaminoMetalLanes(unittest.TestCase):
         self.assertTrue(bool(st_c["converged"][0]))
         np.testing.assert_allclose(lam_32, lam_c, rtol=1e-3, atol=1e-5)
 
+    def test_dvi_dense_pgs_lanes_match_one_lane_bitwise(self):
+        for name, builder_fn in _dvi_pgs_builders().items():
+            with self.subTest(name):
+                problem, solver = _dvi_pgs_problem(self.metal, builder_fn)
+                ncts = problem.data.dim.numpy()
+                self.assertGreater(int(ncts.max()), 32, "the test needs several rows per lane")
+                # One problem on Metal, solved by the CUDA/CPU kernel with one lane and by the Metal
+                # kernel with 32 lanes (row-owned velocity update: same summation order).
+                lam_ref, v_ref, n_ref = _dvi_pgs_solve(problem, solver, _solve_dvi_inequalities_colored_pgs, 1)
+                lam_32, v_32, n_32 = _dvi_pgs_solve(problem, solver)
+                self.assertGreater(n_32, 0)
+                # Ran as one 32-lane SIMD group per world (Warp's coop-block lowering).
+                self.assertEqual(getattr(solver._dense_pgs_kernel().adj, "_metal_coop_block_n", 0), 32)
+                self.assertEqual(n_ref, n_32)
+                self.assertGreater(np.abs(lam_ref).max(), 0.0)
+                np.testing.assert_array_equal(lam_32, lam_ref)
+                np.testing.assert_array_equal(v_32, v_ref)
+                # CPU: same algorithm and rows, but contacts may come in another order and redundant
+                # contact patches split their load non-uniquely; compare each world's total impulse.
+                problem_c, solver_c = _dvi_pgs_problem("cpu", builder_fn)
+                np.testing.assert_array_equal(problem_c.data.dim.numpy(), ncts)
+                lam_c, _v_c, _ = _dvi_pgs_solve(problem_c, solver_c)
+                vio = problem.data.vio.numpy()
+                for w, (o, n) in enumerate(zip(vio, ncts)):
+                    np.testing.assert_allclose(
+                        lam_32[o : o + n].sum(), lam_c[o : o + n].sum(), rtol=2e-3, err_msg=f"world {w}"
+                    )
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
