@@ -56,6 +56,8 @@ def _sync_threads(): ...
 # Kernels
 ###
 
+_vec8f = wp.types.vector(length=8, dtype=wp.float32)
+
 
 @wp.kernel
 def llt_lanes_factorize_kernel(
@@ -82,13 +84,22 @@ def llt_lanes_factorize_kernel(
             s += L[rk + j] * L[rk + j]
         # NOTE: the reduction must stay in the kernel body (not a wp.func) for Metal's lane lowering.
         d = wp.sqrt(A[rk + k] - wp.tile_extract(wp.tile_reduce(wp.add, wp.tile(s)), 0))
-        # Column k below the pivot: each lane updates the rows it owns.
+        # Column k below the pivot: each lane updates the rows it owns. The loads of
+        # L[i, :k] . L[k, :k] are issued eight at a time (see llt_lanes_solve_kernel); the
+        # subtraction stays sequential in j (masked entries subtract an exact zero).
         first = k + 1 + ((lane - (k + 1)) % num_lanes + num_lanes) % num_lanes
         for i in range(first, n, num_lanes):
             ri = m0 + i * n
             acc = A[ri + k]
-            for j in range(k):
-                acc -= L[ri + j] * L[rk + j]
+            for j in range(0, k, 8):
+                lv = _vec8f()
+                kv = _vec8f()
+                for q in range(8):
+                    jq = wp.min(j + q, k - 1)
+                    lv[q] = wp.where(j + q < k, L[ri + jq], 0.0)
+                    kv[q] = L[rk + jq]
+                for q in range(8):
+                    acc -= lv[q] * kv[q]
             L[ri + k] = acc / d
         if lane == k % num_lanes:
             L[rk + k] = d
@@ -96,9 +107,6 @@ def llt_lanes_factorize_kernel(
                 L[rk + j] = wp.float32(0.0)
         # Row k + 1 (owned by another lane) is read by every lane in the next column.
         _sync_threads()
-
-
-_vec8f = wp.types.vector(length=8, dtype=wp.float32)
 
 
 @wp.kernel
