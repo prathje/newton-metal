@@ -9,6 +9,8 @@ from collections.abc import Sequence
 
 import warp as wp
 
+from ......utils.device import is_metal
+
 from ...core.data import DataKamino
 from ...core.model import ModelKamino
 from ...core.types import vec6f
@@ -552,6 +554,15 @@ def _prepare_sparse_inequality_pgs(path: SparseDVIPath, problem: DualProblem) ->
     )
 
 
+def _metal_sparse_inequality_pgs_threads(num_worlds: int) -> int:
+    """Block width of the general sparse PGS kernel on Metal: CUDA's widths.
+
+    Warp's Metal backend runs this barrier-synchronised kernel as one
+    threadgroup per world (wide-block model) instead of one thread per world.
+    """
+    return 128 if num_worlds <= 512 else 64
+
+
 def _launch_sparse_inequality_pgs(
     path: SparseDVIPath,
     problem: DualProblem,
@@ -622,6 +633,8 @@ def _launch_sparse_inequality_pgs(
                 threads_per_world = max(128, threads_per_world)
             elif path.size.num_worlds >= 2048 and threads_per_world == 64:
                 threads_per_world = 32
+        elif is_metal(path.device):
+            threads_per_world = _metal_sparse_inequality_pgs_threads(path.size.num_worlds)
         if delassus._needs_update:
             delassus.update()
         transpose = delassus._transpose_op_matrix
@@ -1690,6 +1703,13 @@ def _solve_sparse_with_bilateral_schur_complement(
             device=path.device,
             block_dim=128,
         )
+    if joint_blocks is None and is_metal(path.device):
+        # One thread per response column instead of one per world (see kernels_metal).
+        from .kernels_metal import _solve_bilateral_unilateral_response_columns  # noqa: PLC0415
+
+        response_kernel = _solve_bilateral_unilateral_response_columns
+        response_dim = (path.size.num_worlds, max(1, max_unilateral_rows))
+        response_block_dim = 256
     if joint_blocks is None:
         wp.launch(
             kernel=response_kernel,

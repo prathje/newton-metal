@@ -11,9 +11,14 @@
 - The DVI dense colored PGS kernel runs as one threadgroup of 64..1024 threads per world on Metal
   (row-owned velocity update, ``dvi/kernels_metal.py``). On one problem it must reproduce the one-lane
   CUDA/CPU kernel bit for bit, and match the CPU solve within tolerance.
+- The bilateral-unilateral response (sparse Schur DVI) runs one thread per column on Metal; it must
+  match the one-lane kernel bit for bit and the CPU kernel within tolerance.
+- The general sparse PGS kernel runs as one 128-thread threadgroup per world on Metal (wide blocks);
+  lanes accumulate with atomics, so it must match one lane and CPU within tolerance.
 """
 
 import unittest
+from unittest import mock
 
 import numpy as np
 import warp as wp
@@ -26,7 +31,14 @@ from newton._src.solvers.kamino._src.linalg.core import DenseLinearOperatorData,
 from newton._src.solvers.kamino._src.linalg.linear import LLTBlockedSolver
 from newton._src.solvers.kamino._src.solvers.common import WarmStartMode
 from newton._src.solvers.kamino._src.solvers.dvi import DVISolver
-from newton._src.solvers.kamino._src.solvers.dvi.kernels import _solve_dvi_inequalities_colored_pgs
+from newton._src.solvers.kamino._src.solvers.dvi import sparse as dvi_sparse
+from newton._src.solvers.kamino._src.solvers.dvi.kernels import (
+    _solve_bilateral_unilateral_response,
+    _solve_dvi_inequalities_colored_pgs,
+)
+from newton._src.solvers.kamino._src.solvers.dvi.kernels_metal import _solve_bilateral_unilateral_response_columns
+from newton._src.solvers.kamino.solver_kamino import SolverKamino
+from newton.tests.kamino import test_kamino_solver_kamino_joint_friction as joint_friction
 from newton._src.solvers.kamino._src.solvers.padmm import PADMMSolver, PADMMWarmStartMode
 from newton.tests.kamino import setup_tests, test_context
 from newton.tests.kamino.test_kamino_solvers_padmm import TestSetup
@@ -168,6 +180,90 @@ def _dvi_pgs_solve(problem, solver, kernel=None, threads_per_world=None):
         solver.__dict__.pop("_dense_pgs_operator", None)
 
 
+def _response_problem(device):
+    """Random bilateral-unilateral response inputs: two worlds, permuted rows, padded strides."""
+    rng = np.random.default_rng(11)
+    njc, nu = [37, 9], [50, 5]
+    ld, stride = 40, 56
+    L = np.zeros((2, ld, ld), np.float32)
+    for w in range(2):
+        n = njc[w]
+        L[w, :n, :n] = np.tril(rng.uniform(-0.3, 0.3, (n, n)))
+        L[w, np.arange(n), np.arange(n)] = rng.uniform(1.0, 2.0, n)
+    perm = np.concatenate([np.pad(rng.permutation(n), (0, ld - n)) for n in njc]).astype(np.int32)
+    arrays = {
+        "dim": np.array([a + b for a, b in zip(njc, nu)], np.int32),
+        "njc": np.array(njc, np.int32),
+        "mio": np.array([0, ld * ld], np.int32),
+        "ld": np.array([ld, ld], np.int32),
+        "vio": np.array([0, ld], np.int32),
+        "P": rng.uniform(0.5, 2.0, 2 * ld).astype(np.float32),
+        "L": L.ravel(),
+        "perm": perm,
+        "rmio": np.array([0, ld * stride], np.int32),
+        "stride": np.array([stride, stride], np.int32),
+        "coupling": rng.uniform(-1.0, 1.0, 2 * ld * stride).astype(np.float32),
+    }
+    a = {k: wp.array(v, device=device) for k, v in arrays.items()}
+    factor = wp.zeros(2 * ld * stride, dtype=wp.float32, device=device)
+    response = wp.zeros(2 * ld * stride, dtype=wp.float32, device=device)
+    inputs = [a["dim"], a["njc"], a["mio"], a["ld"], a["vio"], a["P"], a["L"], a["perm"], True, a["rmio"],
+              a["stride"], a["coupling"], factor, response]
+    return inputs, factor, response, max(nu)
+
+
+def _compact_schur_rollout(device, steps=4):
+    """A short sparse compact-Schur DVI rollout (the joint-friction test's model); returns joint_qd per step."""
+    builder = newton.ModelBuilder()
+    SolverKamino.register_custom_attributes(builder)
+    joint_counts = (40, 9)
+    frictions = np.resize(np.array([0.02, 0.2, 2.0, 20.0]), sum(joint_counts))
+    joint_index = 0
+    for count in joint_counts:
+        builder.begin_world()
+        for _ in range(count):
+            body = builder.add_link(
+                mass=joint_friction._BODY_MASS,
+                inertia=np.eye(3).ravel().tolist(),
+                com=wp.vec3f(joint_friction._BODY_COM_X, 0.0, 0.0),
+                lock_inertia=True,
+            )
+            joint = builder.add_joint_revolute(-1, body, axis=newton.Axis.Y, friction=float(frictions[joint_index]))
+            joint_index += 1
+            builder.add_articulation([joint])
+        builder.end_world()
+    model = builder.finalize(device=device)
+    model.set_gravity((0.0, 0.0, 0.0))
+    config = SolverKamino.Config(
+        dynamics_solver="dvi",
+        sparse_dynamics=True,
+        sparse_jacobian=True,
+        use_collision_detector=False,
+        use_fk_solver=False,
+        dvi=kamino_config.DVISolverConfig(
+            tolerance=1.0e-5,
+            use_schur_complement=True,
+            bilateral_solver_type="LLTBRCM",
+            max_alternating_iterations=8,
+            bilateral_solve_interval=8,
+            inequality_sweeps_per_iteration=2,
+        ),
+    )
+    solver = SolverKamino(model, config)
+    initial = np.resize(np.array([-0.04, 0.008, 0.0, -0.008, 0.04], dtype=np.float32), sum(joint_counts))
+    model.joint_qd.assign(initial * frictions / 2.0)
+    state, next_state = model.state(), model.state()
+    newton.eval_fk(model, model.joint_q, model.joint_qd, state)
+    control = model.control()
+    control.joint_f.assign((np.resize([0.5, -1.5, 1.0001], sum(joint_counts)) * frictions).astype(np.float32))
+    out = []
+    for _ in range(steps):
+        solver.step(state, next_state, control=control, contacts=None, dt=joint_friction.DT)
+        state, next_state = next_state, state
+        out.append(state.joint_qd.numpy().copy())
+    return np.array(out)
+
+
 class TestKaminoMetalLanes(unittest.TestCase):
     def setUp(self):
         if not test_context.setup_done:
@@ -237,6 +333,38 @@ class TestKaminoMetalLanes(unittest.TestCase):
                     np.testing.assert_allclose(
                         lam_32[o : o + n].sum(), lam_c[o : o + n].sum(), rtol=2e-3, err_msg=f"world {w}"
                     )
+    def test_bilateral_response_columns_match_one_lane(self):
+        results = {}
+        for name, device, kernel in (
+            ("cpu", "cpu", _solve_bilateral_unilateral_response),
+            ("metal_1", self.metal, _solve_bilateral_unilateral_response),
+            ("metal_columns", self.metal, _solve_bilateral_unilateral_response_columns),
+        ):
+            inputs, factor, response, max_nu = _response_problem(device)
+            if kernel is _solve_bilateral_unilateral_response:
+                wp.launch(kernel, dim=2, inputs=inputs, device=device, block_dim=1)
+            else:
+                wp.launch(kernel, dim=(2, max_nu), inputs=inputs, device=device, block_dim=256)
+            results[name] = (factor.numpy(), response.numpy())
+        self.assertGreater(np.abs(results["cpu"][1]).max(), 0.1)
+        for a, b in zip(results["metal_columns"], results["metal_1"]):
+            np.testing.assert_array_equal(a, b)
+        for a, b in zip(results["metal_columns"], results["cpu"]):
+            np.testing.assert_allclose(a, b, rtol=1e-4, atol=1e-5)
+
+    def test_sparse_pgs_wide_block_matches_one_lane(self):
+        # One lane first: a kernel object keeps the block model it gets at 128 threads.
+        with mock.patch.object(dvi_sparse, "_metal_sparse_inequality_pgs_threads", lambda num_worlds: 1):
+            qd_1 = _compact_schur_rollout(self.metal)
+        qd_128 = _compact_schur_rollout(self.metal)
+        qd_cpu = _compact_schur_rollout("cpu")
+        kernel = dvi_sparse._solve_dvi_sparse_inequalities_pgs
+        self.assertEqual(getattr(kernel._metal_artifact, "coop_block_n", 0), 128)
+        self.assertGreater(np.abs(qd_cpu).max(), 1e-3)
+        # Lanes accumulate shared updates with atomics: equal within tolerance, not bitwise.
+        np.testing.assert_allclose(qd_128, qd_1, rtol=0.0, atol=2e-6)
+        np.testing.assert_allclose(qd_128, qd_cpu, rtol=0.0, atol=2e-6)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
