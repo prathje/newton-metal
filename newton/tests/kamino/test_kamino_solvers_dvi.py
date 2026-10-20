@@ -33,6 +33,7 @@ from newton._src.solvers.kamino._src.solvers.dvi.kernels import (
     _solve_bilateral_unilateral_response_cooperative,
     _solve_dvi_inequalities_colored_pgs,
 )
+from newton._src.solvers.kamino._src.solvers.dvi.kernels_metal import _DENSE_PGS_ROWS_KERNELS
 from newton._src.solvers.kamino._src.solvers.dvi.projections import (
     contact_friction_normal_load as _contact_friction_normal_load,
 )
@@ -1255,7 +1256,11 @@ class TestDVISolver(NewtonTestCase):
                 def tracked_launch(*args, _kernel=inequality_kernel, _launch=original_launch, **kwargs):
                     nonlocal launch_count
                     kernel = kwargs.get("kernel", args[0] if args else None)
-                    if kernel is _kernel:
+                    # Metal runs the dense sweep with its row-owned variant (dvi/kernels_metal.py).
+                    if kernel is _kernel or (
+                        _kernel is _solve_dvi_inequalities_colored_pgs
+                        and any(kernel is k for k in _DENSE_PGS_ROWS_KERNELS.values())
+                    ):
                         launch_count += 1
                     return _launch(*args, **kwargs)
 
