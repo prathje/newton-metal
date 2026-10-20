@@ -9,6 +9,7 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.utils.device import is_metal, supports_graph_capture
 from newton.sensors import SensorIMU
 from newton.tests.unittest_utils import add_function_test, get_test_devices
 
@@ -282,7 +283,10 @@ def test_body_acceleration_remains_unrequested(test, device):
 
 def test_body_acceleration_cuda_graph(test, device):
     """Replay captured in-place steps with valid body acceleration."""
-    if not device.is_cuda or wp.config.verify_cuda:
+    if is_metal(device):
+        if not supports_graph_capture(device):
+            test.skipTest("Metal graph capture requires Warp's native Metal dispatch")
+    elif not device.is_cuda or wp.config.verify_cuda:
         test.skipTest("CUDA graph capture requires CUDA without verification mode")
 
     model, _, _ = _make_free_body_scene(device)
