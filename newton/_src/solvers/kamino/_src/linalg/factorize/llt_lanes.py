@@ -11,9 +11,9 @@ iteration.
 
 The kernels here run one 32-lane SIMD group per matrix instead. Rows and vector entries are
 owned by lane ``index % block_dim``; dot products are split across lanes and combined with a
-block-wide ``tile_reduce``. The triangular solves only read entries their own lane wrote, so
-they need no barrier. The factorization reads the pivot row written by another lane and
-synchronizes once per column.
+block-wide ``tile_reduce``. The factorization reads the pivot row written by another lane and
+synchronizes once per column. The triangular solves work on panels of ``block_dim`` rows (see
+:func:`llt_lanes_solve_kernel`).
 
 The same code is valid at any ``block_dim`` (one lane on CPU), which the unit tests use as a
 reference. Only :class:`LLTBlockedSolver` on Metal devices launches these kernels.
@@ -98,6 +98,9 @@ def llt_lanes_factorize_kernel(
         _sync_threads()
 
 
+_vec8f = wp.types.vector(length=8, dtype=wp.float32)
+
+
 @wp.kernel
 def llt_lanes_solve_kernel(
     # Inputs:
@@ -112,32 +115,87 @@ def llt_lanes_solve_kernel(
 ):
     """Solves ``L y = b`` then ``L^T x = y`` per block. ``b`` may alias ``x``.
 
-    Entry ``i`` of ``b``, ``y`` and ``x`` is only read and written by lane ``i % block_dim``.
+    Works on panels of ``block_dim`` rows; lane ``r`` owns row ``p0 + r`` of panel ``p0``.
+    Each lane first applies the already-solved part as one dot product (loads issued eight at a
+    time, so a single SIMD group is not bound by one memory round trip per row), then the
+    panel's triangular block is solved by broadcasting each solved entry across the lanes.
+    Panels exchange their results through ``y``/``x``, with one barrier per panel.
     """
     wid, lane = wp.tid()
     num_lanes = wp.block_dim()
     n = dim[wid]
     m0 = mio[wid]
     v0 = vio[wid]
+    last = n - 1
+
     # Forward substitution: y[i] = (b[i] - L[i, :i] . y[:i]) / L[i, i]
-    for i in range(n):
-        ri = m0 + i * n
+    for p0 in range(0, n, num_lanes):
+        i = p0 + lane
+        ic = wp.min(i, last)
+        ri = m0 + ic * n
+        diag = L[ri + ic]
+        res = b[v0 + ic]
+        # Rows above the panel: res -= L[i, :p0] . y[:p0]
         s = wp.float32(0.0)
-        for j in range(lane, i, num_lanes):
-            s += L[ri + j] * y[v0 + j]
-        tot = wp.tile_extract(wp.tile_reduce(wp.add, wp.tile(s)), 0)
-        if lane == i % num_lanes:
-            y[v0 + i] = (b[v0 + i] - tot) / L[ri + i]
+        for j in range(0, p0, 8):
+            lv = _vec8f()
+            yv = _vec8f()
+            for k in range(8):
+                jk = wp.min(j + k, p0 - 1)
+                lv[k] = wp.where(j + k < p0, L[ri + jk], 0.0)
+                yv[k] = y[v0 + jk]
+            s += wp.dot(lv, yv)
+        res -= s
+        # Triangular block of the panel
+        for jb in range(0, num_lanes, 8):
+            lv = _vec8f()
+            for k in range(8):
+                lv[k] = L[ri + wp.min(p0 + jb + k, last)]
+            for k in range(8):
+                jj = jb + k
+                if jj < num_lanes:
+                    # Lane jj's entry is final at step jj (rows above it are applied).
+                    yb = wp.tile_extract(wp.tile(res / diag), jj)
+                    if lane > jj:
+                        res -= lv[k] * yb
+        if i < n:
+            y[v0 + i] = res / diag
+        _sync_threads()
+
     # Backward substitution: x[i] = (y[i] - L[i+1:, i] . x[i+1:]) / L[i, i]
-    for ii in range(n):
-        i = n - 1 - ii
-        first = i + 1 + ((lane - (i + 1)) % num_lanes + num_lanes) % num_lanes
+    num_panels = (n + num_lanes - 1) // num_lanes
+    for pp in range(num_panels):
+        p0 = (num_panels - 1 - pp) * num_lanes
+        i = p0 + lane
+        ic = wp.min(i, last)
+        diag = L[m0 + ic * n + ic]
+        res = y[v0 + ic]
+        # Rows below the panel: res -= L[p0 + num_lanes:, i] . x[p0 + num_lanes:]
         s = wp.float32(0.0)
-        for j in range(first, n, num_lanes):
-            s += L[m0 + j * n + i] * x[v0 + j]
-        tot = wp.tile_extract(wp.tile_reduce(wp.add, wp.tile(s)), 0)
-        if lane == i % num_lanes:
-            x[v0 + i] = (y[v0 + i] - tot) / L[m0 + i * n + i]
+        for j in range(p0 + num_lanes, n, 8):
+            lv = _vec8f()
+            xv = _vec8f()
+            for k in range(8):
+                jk = wp.min(j + k, last)
+                lv[k] = wp.where(j + k < n, L[m0 + jk * n + ic], 0.0)
+                xv[k] = x[v0 + jk]
+            s += wp.dot(lv, xv)
+        res -= s
+        # Triangular block of the panel, bottom row first
+        for jb in range(0, num_lanes, 8):
+            lv = _vec8f()
+            for k in range(8):
+                jj = num_lanes - 1 - (jb + k)
+                lv[k] = L[m0 + wp.clamp(p0 + jj, 0, last) * n + ic]
+            for k in range(8):
+                jj = num_lanes - 1 - (jb + k)
+                if jj >= 0 and p0 + jj < n:
+                    xb = wp.tile_extract(wp.tile(res / diag), jj)
+                    if lane < jj:
+                        res -= lv[k] * xb
+        if i < n:
+            x[v0 + i] = res / diag
+        _sync_threads()
 
 
 ###
