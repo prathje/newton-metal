@@ -8,9 +8,9 @@
 - The accelerated PADMM projection kernel runs with 32 lanes per world on Metal. With more constraint
   rows than lanes each lane handles several rows; the result must match a one-lane launch (the
   serial sweep the CPU runs) and the CPU solve.
-- The DVI dense colored PGS kernel runs with 32 lanes per world on Metal (row-owned velocity update,
-  ``dvi/kernels_metal.py``). On one problem it must reproduce the one-lane CUDA/CPU kernel bit for
-  bit, and match the CPU solve within tolerance.
+- The DVI dense colored PGS kernel runs as one threadgroup of 64..1024 threads per world on Metal
+  (row-owned velocity update, ``dvi/kernels_metal.py``). On one problem it must reproduce the one-lane
+  CUDA/CPU kernel bit for bit, and match the CPU solve within tolerance.
 """
 
 import unittest
@@ -30,7 +30,7 @@ from newton._src.solvers.kamino._src.solvers.dvi.kernels import _solve_dvi_inequ
 from newton._src.solvers.kamino._src.solvers.padmm import PADMMSolver, PADMMWarmStartMode
 from newton.tests.kamino import setup_tests, test_context
 from newton.tests.kamino.test_kamino_solvers_padmm import TestSetup
-from newton.tests.kamino.test_kamino_solvers_dvi import _build_five_box_stack
+from newton.tests.kamino.test_kamino_solvers_dvi import _build_five_box_stack, _build_reduced_kapla_tower
 from newton.tests.kamino.utils.make import make_containers, update_containers
 from newton.tests.kamino.utils.rand import RandomProblemLLT
 from newton.tests.utils import basics
@@ -95,14 +95,23 @@ def _dvi_pgs_builders():
         builder.replicate(builder=_build_five_box_stack(), world_count=3)
         return builder
 
-    return {"five_box_stacks": stacks, "fourbar_and_boxes": _padmm_builder}
+    def kapla():
+        return _build_reduced_kapla_tower(layer_count=3)[0]
+
+    # name -> (builder, forced block width or None for the solver's choice)
+    return {
+        "five_box_stacks": (stacks, None),
+        "fourbar_and_boxes": (_padmm_builder, None),
+        # 64 threads for a few hundred rows: every thread owns several rows.
+        "kapla_tower_64_threads": (kapla, 64),
+    }
 
 
 def _dvi_pgs_problem(device, builder_fn):
     """A dense DVI problem with contacts (and, for the four-bar, bilateral joint rows)."""
     model = ModelKamino.from_newton(builder_fn().finalize(device=device))
     model, data, state, limits, detector, jacobians = make_containers(
-        model=model, max_world_contacts=64, sparse=False, dt=1.0e-3
+        model=model, max_world_contacts=256, sparse=False, dt=1.0e-3
     )
     update_containers(model, data, state, limits, detector, jacobians)
     problem = DualProblem(
@@ -136,16 +145,18 @@ def _dvi_pgs_problem(device, builder_fn):
 def _dvi_pgs_solve(problem, solver, kernel=None, threads_per_world=None):
     """Solve with an overridden dense PGS kernel / block width; returns (lambdas, v_aug, kernel launches)."""
     launches = [0]
-    pick_kernel = solver._dense_pgs_kernel
-    chosen = kernel or pick_kernel()
+    if threads_per_world is not None:
+        solver._dense_pgs_threads_per_world = lambda: threads_per_world
+    chosen = kernel or solver._dense_pgs_kernel()
 
     def _kernel():
         launches[0] += 1
         return chosen
 
     solver._dense_pgs_kernel = _kernel
-    if threads_per_world is not None:
-        solver._dense_pgs_threads_per_world = lambda: threads_per_world
+    if chosen is _solve_dvi_inequalities_colored_pgs:
+        # The CUDA/CPU kernel reads the operator directly (no transposed copy).
+        solver._dense_pgs_operator = lambda _problem, _mio, D: (D,)
     try:
         solver.reset()
         solver.coldstart()
@@ -154,6 +165,7 @@ def _dvi_pgs_solve(problem, solver, kernel=None, threads_per_world=None):
     finally:
         del solver._dense_pgs_kernel
         solver.__dict__.pop("_dense_pgs_threads_per_world", None)
+        solver.__dict__.pop("_dense_pgs_operator", None)
 
 
 class TestKaminoMetalLanes(unittest.TestCase):
@@ -191,18 +203,26 @@ class TestKaminoMetalLanes(unittest.TestCase):
         np.testing.assert_allclose(lam_32, lam_c, rtol=1e-3, atol=1e-5)
 
     def test_dvi_dense_pgs_lanes_match_one_lane_bitwise(self):
-        for name, builder_fn in _dvi_pgs_builders().items():
+        for name, (builder_fn, width) in _dvi_pgs_builders().items():
             with self.subTest(name):
                 problem, solver = _dvi_pgs_problem(self.metal, builder_fn)
                 ncts = problem.data.dim.numpy()
                 self.assertGreater(int(ncts.max()), 32, "the test needs several rows per lane")
                 # One problem on Metal, solved by the CUDA/CPU kernel with one lane and by the Metal
-                # kernel with 32 lanes (row-owned velocity update: same summation order).
+                # kernel with one threadgroup per world (row-owned velocity update: same summation
+                # order).
                 lam_ref, v_ref, n_ref = _dvi_pgs_solve(problem, solver, _solve_dvi_inequalities_colored_pgs, 1)
-                lam_32, v_32, n_32 = _dvi_pgs_solve(problem, solver)
+                lam_32, v_32, n_32 = _dvi_pgs_solve(problem, solver, threads_per_world=width)
                 self.assertGreater(n_32, 0)
-                # Ran as one 32-lane SIMD group per world (Warp's coop-block lowering).
-                self.assertEqual(getattr(solver._dense_pgs_kernel().adj, "_metal_coop_block_n", 0), 32)
+                # Ran as one real threadgroup per world (Warp's wide-block model), with more
+                # threads than one SIMD group and fewer than the rows.
+                width = width or solver._dense_pgs_threads_per_world()
+                self.assertGreater(width, 32)
+                if name.startswith("kapla"):
+                    self.assertGreater(int(ncts.max()), 4 * width)
+                from newton._src.solvers.kamino._src.solvers.dvi.kernels_metal import dense_pgs_rows_kernel
+
+                self.assertEqual(getattr(dense_pgs_rows_kernel(width).adj, "_metal_coop_block_n", 0), width)
                 self.assertEqual(n_ref, n_32)
                 self.assertGreater(np.abs(lam_ref).max(), 0.0)
                 np.testing.assert_array_equal(lam_32, lam_ref)
