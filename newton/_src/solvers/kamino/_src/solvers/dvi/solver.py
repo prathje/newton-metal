@@ -126,6 +126,8 @@ class DVISolver:
         self._limits: LimitsKamino | None = None
         self._contacts: ContactsKamino | None = None
         self._sparse_path: SparseDVIPath | None = None
+        # Metal only: transposed dense operator for the PGS velocity update.
+        self._metal_pgs_transposed: wp.array[wp.float32] | None = None
         self._all_worlds_mask: wp.array[wp.bool] | None = None
         self._device: wp.DeviceLike = None
         self._joint_rows_host: list[int] = []
@@ -488,6 +490,12 @@ class DVISolver:
                 )
             elif self._use_schur_complement:
                 self._data.state.allocate_dense_projection(self._size)
+            if not problem.sparse and is_metal(self.device):
+                size = problem.data.D.size
+                if self._data.state.projected_D is not None:
+                    size = max(size, self._data.state.projected_D.size)
+                if self._metal_pgs_transposed is None or self._metal_pgs_transposed.size < size:
+                    self._metal_pgs_transposed = wp.empty(size, dtype=wp.float32, device=self.device)
 
     def solve(self, problem: DualProblem):
         """Solve the cone-complementarity problem defined by ``problem``.
@@ -780,23 +788,50 @@ class DVISolver:
         return self._has_unilateral_constraints and self._size.sum_of_num_bilateral_joint_cts == 0
 
     def _dense_pgs_kernel(self):
-        """Dense colored PGS kernel; Metal uses the row-owned variant (see ``kernels_metal``)."""
+        """Dense colored PGS kernel; Metal uses the row-owned wide-block variant (see ``kernels_metal``)."""
         if is_metal(self.device):
-            from .kernels_metal import _solve_dvi_inequalities_colored_pgs_rows  # noqa: PLC0415
+            from .kernels_metal import dense_pgs_rows_kernel  # noqa: PLC0415
 
-            return _solve_dvi_inequalities_colored_pgs_rows
+            return dense_pgs_rows_kernel(self._dense_pgs_threads_per_world())
         return _solve_dvi_inequalities_colored_pgs
+
+    def _dense_pgs_operator(self, problem: DualProblem, mio: wp.array, D: wp.array) -> tuple:
+        """Dense operator inputs of the PGS kernel: ``(D,)``, or ``(D, D^T)`` on Metal.
+
+        The Metal kernel reads the row-owned velocity update from a per-world
+        transposed copy so that a SIMD group's lanes (consecutive rows) load
+        consecutive addresses. The copy holds the same values (``D`` is not
+        bitwise symmetric: preconditioning and the Schur complement round
+        ``D_ij`` and ``D_ji`` differently).
+        """
+        if not is_metal(self.device):
+            return (D,)
+        from .kernels_metal import _transpose_dense_world_blocks  # noqa: PLC0415
+
+        D_t = self._metal_pgs_transposed  # allocated by _allocate_projection_workspace
+        n = self._size.max_of_max_total_cts
+        wp.launch(
+            kernel=_transpose_dense_world_blocks,
+            dim=(self._size.num_worlds, n * n),
+            inputs=[problem.data.dim, mio, D, D_t],
+            device=self.device,
+        )
+        return (D, D_t)
 
     def _dense_pgs_threads_per_world(self) -> int:
         """Block width of the dense colored PGS kernel.
 
-        CUDA uses 64 threads per world; Metal one 32-lane SIMD group (Warp's
-        coop-block lowering: real barriers and SIMD reductions); CPU one lane.
+        CUDA uses 64 threads per world and CPU one lane. Metal runs the
+        row-owned kernel as one threadgroup per world (Warp's wide-block
+        model): the largest power of two not above the constraint rows per
+        world, in [64, 1024]. A single 32-lane SIMD group per world is
+        5-17x slower on one-world scenes (no latency hiding, low issue rate).
         """
         if self.device.is_cuda:
             return 64
         if is_metal(self.device):
-            return 32
+            rows = max(1, self._size.max_of_max_total_cts)
+            return min(1024, max(64, 1 << (rows.bit_length() - 1)))
         return 1
 
     def _solve_dense_inequality_pgs(self, problem: DualProblem) -> None:
@@ -828,6 +863,7 @@ class DVISolver:
             device=self.device,
         )
         threads_per_world = self._dense_pgs_threads_per_world()
+        pgs_operator = self._dense_pgs_operator(problem, problem.data.mio, problem.data.D)
         # Inequality-only solves need no host work between PGS blocks.
         for block_iteration in (_FUSED_INEQUALITY_BLOCK,):
             wp.launch(
@@ -849,7 +885,7 @@ class DVISolver:
                     problem.data.mu,
                     problem.data.bound_lower,
                     problem.data.bound_upper,
-                    problem.data.D,
+                    *pgs_operator,
                     problem.data.P,
                     problem.data.v_b,
                     block_iteration,
@@ -963,6 +999,7 @@ class DVISolver:
         )
         self._prepare_inequality_coloring(problem)
         threads_per_world = self._dense_pgs_threads_per_world()
+        pgs_operator = self._dense_pgs_operator(problem, problem.data.mio, problem.data.D)
         for block_iteration in range(self._max_alternating_iterations):
             wp.launch(
                 kernel=_compute_dvi_unilateral_velocities,
@@ -1001,7 +1038,7 @@ class DVISolver:
                     problem.data.mu,
                     problem.data.bound_lower,
                     problem.data.bound_upper,
-                    problem.data.D,
+                    *pgs_operator,
                     problem.data.P,
                     problem.data.v_b,
                     block_iteration,
@@ -1128,6 +1165,7 @@ class DVISolver:
         block_iterations = (
             range(self._max_alternating_iterations) if has_intermediate_bilateral_solve else (_FUSED_BILATERAL_BLOCK,)
         )
+        pgs_operator = self._dense_pgs_operator(problem, self._data.state.projected_mio, self._data.state.projected_D)
         for block_iteration in block_iterations:
             wp.launch(
                 kernel=self._dense_pgs_kernel(),
@@ -1148,7 +1186,7 @@ class DVISolver:
                     problem.data.mu,
                     problem.data.bound_lower,
                     problem.data.bound_upper,
-                    self._data.state.projected_D,
+                    *pgs_operator,
                     problem.data.P,
                     problem.data.v_b,
                     block_iteration,
