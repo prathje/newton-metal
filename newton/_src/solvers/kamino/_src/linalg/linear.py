@@ -20,9 +20,11 @@ import numpy as np
 import warp as wp
 
 from .....core.types import override
+from .....utils.device import is_metal
 from . import conjugate, factorize
 from .conjugate_fused import MAX_BLOCKS_PER_ROW, build_row_index, build_transpose_index, make_fused_cr_kernel
 from .core import DenseLinearOperatorData, DenseSquareMultiLinearInfo, make_dtype_tolerance
+from .factorize import llt_lanes
 from .sparse_matrix import (
     BlockSparseMatrices,
     allocate_block_sparse_from_dense,
@@ -687,8 +689,22 @@ class LLTBlockedSolver(DirectSolver[ScalarType, IndexType]):
         self._y.zero_()
         self._has_factors = False
 
+    def _use_lanes(self) -> bool:
+        # Warp's Metal backend runs the blocked tile kernels with one thread per matrix;
+        # use the lane-parallel kernels there (see ``factorize.llt_lanes``).
+        return self._dtype == wp.float32 and is_metal(self._device)
+
     @override
     def _factorize_impl(self, A: wp.array[ScalarType]) -> None:
+        if self._use_lanes():
+            llt_lanes.llt_lanes_factorize(
+                num_blocks=self._operator.info.num_blocks,
+                dim=self._operator.info.dim,
+                mio=self._operator.info.mio,
+                A=A,
+                L=self._L,
+            )
+            return
         factorize.llt_blocked_factorize(
             kernel=self._factorize_kernel,
             num_blocks=self._operator.info.num_blocks,
@@ -706,6 +722,18 @@ class LLTBlockedSolver(DirectSolver[ScalarType, IndexType]):
     @override
     def _solve_impl(self, b: wp.array[ScalarType], x: wp.array[ScalarType]) -> None:
         # Solve the system L * y = b and L^T * x = y
+        if self._use_lanes():
+            llt_lanes.llt_lanes_solve(
+                num_blocks=self._operator.info.num_blocks,
+                dim=self._operator.info.dim,
+                mio=self._operator.info.mio,
+                vio=self._operator.info.vio,
+                L=self._L,
+                b=b,
+                y=self._y,
+                x=x,
+            )
+            return
         factorize.llt_blocked_solve(
             kernel=self._solve_kernel,
             num_blocks=self._operator.info.num_blocks,
@@ -722,6 +750,17 @@ class LLTBlockedSolver(DirectSolver[ScalarType, IndexType]):
     @override
     def _solve_inplace_impl(self, x: wp.array[ScalarType]) -> None:
         # Solve the system L * y = b and L^T * x = y
+        if self._use_lanes():
+            llt_lanes.llt_lanes_solve_inplace(
+                num_blocks=self._operator.info.num_blocks,
+                dim=self._operator.info.dim,
+                mio=self._operator.info.mio,
+                vio=self._operator.info.vio,
+                L=self._L,
+                y=self._y,
+                x=x,
+            )
+            return
         factorize.llt_blocked_solve_inplace(
             kernel=self._solve_inplace_kernel,
             num_blocks=self._operator.info.num_blocks,
