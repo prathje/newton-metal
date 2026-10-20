@@ -206,9 +206,14 @@ class Example:
     def capture(self):
         self.graph = None
         if newton.examples.supports_graph_capture(self.device) and not wp.config.verify_cuda:
+            # simulate() advances the host-side step counter, but recording
+            # does not run a step: restore it so resets happen on the same
+            # frame as without capture (step() adds the substeps per replay).
+            sim_steps = self.sim_steps
             with wp.ScopedCapture() as capture:
                 self.simulate()
             self.graph = capture.graph
+            self.sim_steps = sim_steps
 
     def simulate(self):
         for _ in range(self.sim_substeps):
