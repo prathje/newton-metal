@@ -57,6 +57,15 @@ from .wind import Wind
 PROFILE_ENABLED = os.environ.get("NEWTON_PROFILE", "0") != "0"
 
 
+# The matrix kernels below write USD's ``mat44d`` (float64) prim matrices.
+# Apple GPUs have no fp64 and Warp's Metal backend rejects float64 arrays
+# unless the module opts into software fp64, which converts and stores
+# binary64 exactly. Only Warp builds with Metal enabled carry the option, so
+# CPU/CUDA builds see the same module options (and module hash) as before.
+if getattr(wp.config, "enable_metal", False):
+    wp.set_module_options({"metal_fp64": "emulate"})
+
+
 @wp.kernel(enable_backward=False)
 def write_transforms(xform: wp.array[wp.transform], scale: wp.array[wp.vec3], m_out: wp.array[wp.mat44d]):
     tid = wp.tid()
