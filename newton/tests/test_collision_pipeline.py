@@ -7703,5 +7703,76 @@ add_function_test(
 )
 
 
+def _boxes_on_ground_model(device, n_boxes=4):
+    builder = newton.ModelBuilder()
+    builder.add_ground_plane()
+    for i in range(n_boxes):
+        body = builder.add_body(xform=wp.transform((1.5 * i, 0.0, 0.49), wp.quat_identity()))
+        builder.add_shape_box(body, hx=0.5, hy=0.5, hz=0.5)
+    return builder.finalize(device=device)
+
+
+def _overflow_warnings(caught):
+    return [str(w.message) for w in caught if "Contact buffer overflowed" in str(w.message)]
+
+
+def test_metal_contact_overflow_warns_once(test, device):
+    """An undersized contact buffer on Metal warns once (the printf is compiled out there)."""
+    model = _boxes_on_ground_model(device)
+    state = model.state()
+
+    # Large enough: no warning.
+    pipeline = newton.CollisionPipeline(model, broad_phase="nxn", rigid_contact_max=1024)
+    contacts = pipeline.contacts()
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        for _ in range(3):
+            pipeline.collide(state, contacts)
+            wp.synchronize_device(device)
+    full_count = int(contacts.rigid_contact_count.numpy()[0])
+    test.assertGreater(full_count, 2)
+    test.assertEqual(_overflow_warnings(caught), [])
+
+    pipeline = newton.CollisionPipeline(model, broad_phase="nxn", rigid_contact_max=2)
+    contacts = pipeline.contacts()
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        pipeline.collide(state, contacts)
+        # The overflow of a step is read without a sync, on a later collide().
+        wp.synchronize_device(device)
+        for _ in range(4):
+            pipeline.collide(state, contacts)
+            wp.synchronize_device(device)
+    msgs = _overflow_warnings(caught)
+    test.assertEqual(len(msgs), 1, msgs)
+    test.assertIn(f"{full_count} > 2", msgs[0])
+
+    # A captured collide never reads on the host; the next eager call reports.
+    pipeline = newton.CollisionPipeline(model, broad_phase="nxn", rigid_contact_max=2)
+    contacts = pipeline.contacts()
+    pipeline.collide(state, contacts)  # warm-up (compiles outside the capture)
+    wp.synchronize_device(device)
+    pipeline.narrow_phase._metal_overflow_monitor.flags.zero_()
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        pipeline.narrow_phase._metal_overflow_monitor.warned.clear()
+        with wp.ScopedCapture(device=device) as capture:
+            pipeline.collide(state, contacts)
+        test.assertEqual(_overflow_warnings(caught), [])
+        wp.capture_launch(capture.graph)
+        wp.synchronize_device(device)
+        pipeline.collide(state, contacts)
+    test.assertEqual(len(_overflow_warnings(caught)), 1)
+
+
+_metal_devices = [d for d in get_test_devices() if getattr(wp.get_device(d), "is_metal", False)]
+add_function_test(
+    TestCollisionPipeline,
+    "test_metal_contact_overflow_warns_once",
+    test_metal_contact_overflow_warns_once,
+    devices=_metal_devices,
+)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2, failfast=False)
