@@ -524,6 +524,13 @@ class _OutputCapture:
         return None
 
 
+# Warp's Metal backend compiles ``wp.print``/``wp.printf`` out and says so once
+# per process, in whichever test first compiles such a kernel (e.g. the
+# collision pipeline's ``verify_narrow_phase_buffers``). It is a backend
+# notice, not output of the test, so every test allows it.
+_METAL_PRINT_NOTICE_RE = r"^Warp UserWarning: wp\.print\(\)/wp\.printf\(\) calls .*compiled out on Metal devices .*\n?"
+
+
 class NewtonTestCase(unittest.TestCase):
     """TestCase with strict stdout/stderr output checking.
 
@@ -538,6 +545,7 @@ class NewtonTestCase(unittest.TestCase):
         self._output_capture = _OutputCapture()
         self._output_capture.begin()
         self.addCleanup(self._finish_output_capture)
+        self._output_capture.add_pattern(_METAL_PRINT_NOTICE_RE, stream="stderr", required=False)
         super()._callSetUp()
 
     def expectOutputRegex(self, regex: str, *, stream: str = "any"):
