@@ -527,6 +527,15 @@ def _metal_sparse_inequality_pgs_threads(num_worlds: int) -> int:
     return 128 if num_worlds <= 512 else 64
 
 
+def _metal_sparse_contact_pgs_threads() -> int:
+    """Block width of the contact-only sparse PGS kernel on Metal (CUDA's default width).
+
+    Like the general kernel it is barrier-synchronised; Warp's Metal backend runs it
+    as one threadgroup per world.
+    """
+    return 64
+
+
 def _launch_sparse_inequality_pgs(
     path: SparseDVIPath,
     problem: DualProblem,
@@ -553,6 +562,8 @@ def _launch_sparse_inequality_pgs(
         if path.size.max_of_max_contacts >= 2048:
             # This kernel exceeds CUDA graph resource limits at 512 threads on some devices.
             threads_per_world = 256
+    elif is_metal(path.device):
+        threads_per_world = _metal_sparse_contact_pgs_threads()
     contact_only = (
         path.size.max_of_num_bounded_joint_cts == 0
         and path.size.max_of_max_limits == 0
