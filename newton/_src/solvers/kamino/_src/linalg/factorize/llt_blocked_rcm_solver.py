@@ -31,7 +31,7 @@ from typing import Any
 import warp as wp
 
 from ......core.types import override
-from ......utils.device import active_capture_key, is_capturing
+from ......utils.device import active_capture_key, is_capturing, is_metal
 from ...core.types import FloatType, to_warp_int32_array
 from ..core import DenseLinearOperatorData, DenseSquareMultiLinearInfo
 from ..linear import DirectSolver
@@ -398,6 +398,9 @@ class LLTBlockedRCMSolver(DirectSolver[wp.float32, wp.int32]):
         self._structural_pattern = None
         self._structural_ready = None
 
+        if is_metal(self._device):
+            self._use_metal_kernels()
+
         # Resolve auxiliary kernels now that max_dim is known.
         self._permute_vector_kernel = make_llt_blocked_rcm_permute_vector_kernel(self._max_dim)
         self._fused_permute_and_tp_kernel = make_llt_blocked_rcm_fused_permute_and_tp_kernel(
@@ -449,6 +452,18 @@ class LLTBlockedRCMSolver(DirectSolver[wp.float32, wp.int32]):
         # pointer changes.
 
         self._has_factors = False
+
+    def _use_metal_kernels(self) -> None:
+        """Swap in the tile-free Metal factorize/solve kernels (same arguments; see
+        :mod:`.llt_blocked_rcm_metal`). They need a fixed block width and factor one
+        matrix per threadgroup, so the panel-parallel path is not used."""
+        from . import llt_blocked_rcm_metal as _metal  # noqa: PLC0415
+
+        self._factorize_block_dim = _metal.METAL_FACTORIZE_BLOCK_DIM
+        self._solve_block_dim = _metal.METAL_SOLVE_BLOCK_DIM
+        self._parallel_factorization = False
+        self._factorize_kernel = _metal.factorize_kernel(self._block_size, self._factorize_block_dim)
+        self._solve_kernel, self._solve_inplace_kernel = _metal.solve_kernels(self._block_size, self._solve_block_dim)
 
     @override
     def _reset_impl(self) -> None:
