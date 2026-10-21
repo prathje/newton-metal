@@ -6018,6 +6018,41 @@ class TestImplicitMetalMatchesCpu(unittest.TestCase):
             np.testing.assert_allclose(p_got, p_ref, rtol=1e-14, atol=1e-15, err_msg=f"impulse, step {step}")
             np.testing.assert_array_equal(f_got, f_ref, err_msg=f"effort, step {step}")
 
+    @unittest.skipUnless(_HAS_ONNX and _HAS_WARP_NN, "onnx or warp-nn not installed")
+    def test_neural_mlp_multi_world_matches_cpu(self):
+        """A batched MLP linearization (partial network tiles) solves the same on Metal and CPU."""
+        tmp_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp_dir, ignore_errors=True)
+        path = os.path.join(tmp_dir, "mlp.onnx")
+        _build_mlp_onnx(path, np.array([[30.0, 4.0]], dtype=np.float32), np.array([1.5], dtype=np.float32))
+
+        def run(device):
+            model = _build_two_link(device, worlds=3)
+            n = model.joint_dof_count
+            rng = np.random.default_rng(0)
+            state = model.state()
+            state.joint_q.assign(rng.uniform(-1.0, 1.0, n).astype(np.float32))
+            state.joint_qd.assign(rng.uniform(-3.0, 3.0, n).astype(np.float32))
+            control = model.control()
+            drive = DriveNeuralMLP(model_path=path)
+            response = JointSpaceResponse(model)
+            actuator = Actuator(
+                indices=wp.array(np.arange(n), dtype=wp.uint32, device=device),
+                drive=drive,
+                control_target_pos_attr="joint_target_q",
+                control_target_vel_attr="joint_target_qd",
+            )
+            actuator.set_effort_mode_implicit(response=response)
+            response.refresh(state)
+            control.joint_f.zero_()
+            actuator.step(state, control, actuator.state(), actuator.state(), dt=0.01)
+            return drive._lin_params.numpy(), control.joint_f.numpy()
+
+        (pack_ref, f_ref), (pack_got, f_got) = run(wp.get_device("cpu")), run(_metal_device())
+        self.assertTrue(np.all(pack_ref[:, 2] != 0.0), "every DOF must have a velocity slope")
+        np.testing.assert_allclose(pack_got, pack_ref, rtol=1e-5, atol=1e-5)
+        np.testing.assert_allclose(f_got, f_ref, rtol=1e-4, atol=1e-4)
+
 
 if __name__ == "__main__":
     unittest.main()
