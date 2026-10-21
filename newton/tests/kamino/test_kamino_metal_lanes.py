@@ -11,9 +11,13 @@
 - The DVI dense colored PGS kernel runs as one threadgroup of 64..1024 threads per world on Metal
   (row-owned velocity update, ``dvi/kernels_metal.py``). On one problem it must reproduce the one-lane
   CUDA/CPU kernel bit for bit, and match the CPU solve within tolerance.
-- The bilateral-unilateral response (sparse Schur DVI) runs one thread per column on Metal; it must
-  match the one-lane kernel bit for bit and the CPU kernel within tolerance.
-- The general sparse PGS kernel runs as one 128-thread threadgroup per world on Metal (wide blocks),
+- The bilateral-unilateral response (sparse Schur DVI) runs one thread per column on Metal and skips
+  exactly-zero terms (RCM tile mask, zero coupling rows, all-zero solution tiles); it must match the
+  one-lane kernel bit for bit and the CPU kernel within tolerance.
+- :class:`LLTBlockedRCMSolver` uses tile-free factorize/solve kernels on Metal
+  (``llt_blocked_rcm_metal``); with the same RCM order its factor and solutions are bit-identical to CPU.
+- The general sparse PGS kernel runs as one 256-thread threadgroup per world on Metal for a few worlds
+  (wide blocks),
   the contact-only one with 64 threads; lanes accumulate with atomics, so both must match one lane and
   CPU within tolerance.
 """
@@ -29,6 +33,7 @@ import newton._src.solvers.kamino.config as kamino_config
 from newton._src.solvers.kamino._src.core.model import ModelKamino
 from newton._src.solvers.kamino._src.dynamics.dual import DualProblem
 from newton._src.solvers.kamino._src.linalg.core import DenseLinearOperatorData, DenseSquareMultiLinearInfo
+from newton._src.solvers.kamino._src.linalg.factorize.llt_blocked_rcm_solver import LLTBlockedRCMSolver
 from newton._src.solvers.kamino._src.linalg.linear import LLTBlockedSolver
 from newton._src.solvers.kamino._src.solvers.common import WarmStartMode
 from newton._src.solvers.kamino._src.solvers.dvi import DVISolver
@@ -38,12 +43,12 @@ from newton._src.solvers.kamino._src.solvers.dvi.kernels import (
     _solve_dvi_inequalities_colored_pgs,
 )
 from newton._src.solvers.kamino._src.solvers.dvi.kernels_metal import _solve_bilateral_unilateral_response_columns
-from newton._src.solvers.kamino.solver_kamino import SolverKamino
-from newton.tests.kamino import test_kamino_solver_kamino_joint_friction as joint_friction
 from newton._src.solvers.kamino._src.solvers.padmm import PADMMSolver, PADMMWarmStartMode
+from newton._src.solvers.kamino.solver_kamino import SolverKamino
 from newton.tests.kamino import setup_tests, test_context
-from newton.tests.kamino.test_kamino_solvers_padmm import TestSetup
+from newton.tests.kamino import test_kamino_solver_kamino_joint_friction as joint_friction
 from newton.tests.kamino.test_kamino_solvers_dvi import _build_five_box_stack, _build_reduced_kapla_tower
+from newton.tests.kamino.test_kamino_solvers_padmm import TestSetup
 from newton.tests.kamino.utils.make import make_containers, update_containers
 from newton.tests.kamino.utils.rand import RandomProblemLLT
 from newton.tests.utils import basics
@@ -134,6 +139,7 @@ def _dvi_pgs_builders():
         "five_box_stacks_coop_tiles_off": (stacks, 256, True, False),
     }
 
+
 def _dvi_pgs_problem(device, builder_fn):
     """A dense DVI problem with contacts (and, for the four-bar, bilateral joint rows)."""
     model = ModelKamino.from_newton(builder_fn().finalize(device=device))
@@ -195,19 +201,41 @@ def _dvi_pgs_solve(problem, solver, kernel=None, threads_per_world=None):
         solver.__dict__.pop("_dense_pgs_operator", None)
 
 
-def _response_problem(device):
-    """Random bilateral-unilateral response inputs: two worlds, permuted rows, padded strides."""
+def _response_problem(device, block_sparse=False):
+    """Two worlds of bilateral-unilateral response inputs.
+
+    ``block_sparse``: the factor is zero outside a random 8x8-tile mask (as the
+    RCM factorization leaves it) and some coupling columns are zero or start
+    with zero rows; the Metal kernel then skips those terms.
+    """
     rng = np.random.default_rng(11)
     njc, nu = [37, 9], [50, 5]
-    ld, stride = 40, 56
+    ld, stride, bs = 40, 56, 8
     L = np.zeros((2, ld, ld), np.float32)
+    patterns = []
     for w in range(2):
         n = njc[w]
         L[w, :n, :n] = np.tril(rng.uniform(-0.3, 0.3, (n, n)))
+        tiles = (n + bs - 1) // bs
+        pattern = np.ones((tiles, tiles), np.int32)
+        if block_sparse:
+            pattern = np.tril((rng.random((tiles, tiles)) < 0.4).astype(np.int32), -1)
+            pattern[np.arange(tiles), np.arange(tiles)] = 1
+            mask = np.kron(pattern, np.ones((bs, bs)))[:n, :n]
+            L[w, :n, :n] *= mask
+        patterns.append(pattern.ravel())
         L[w, np.arange(n), np.arange(n)] = rng.uniform(1.0, 2.0, n)
     perm = np.concatenate([np.pad(rng.permutation(n), (0, ld - n)) for n in njc]).astype(np.int32)
+    coupling = rng.uniform(-1.0, 1.0, (2, ld, stride)).astype(np.float32)
+    if block_sparse:
+        # Columns 0-9: zero; columns 10-29: nonzero only from a random permuted row on.
+        coupling[:, :, :10] = 0.0
+        for w in range(2):
+            for col in range(10, 30):
+                first = rng.integers(0, njc[w])
+                coupling[w, perm[w * ld : w * ld + first], col] = 0.0
     arrays = {
-        "dim": np.array([a + b for a, b in zip(njc, nu)], np.int32),
+        "dim": np.array([a + b for a, b in zip(njc, nu, strict=True)], np.int32),
         "njc": np.array(njc, np.int32),
         "mio": np.array([0, ld * ld], np.int32),
         "ld": np.array([ld, ld], np.int32),
@@ -217,14 +245,82 @@ def _response_problem(device):
         "perm": perm,
         "rmio": np.array([0, ld * stride], np.int32),
         "stride": np.array([stride, stride], np.int32),
-        "coupling": rng.uniform(-1.0, 1.0, 2 * ld * stride).astype(np.float32),
+        "coupling": coupling.ravel(),
+        "tpo": np.array([0, patterns[0].size], np.int32),
+        "pattern": np.concatenate(patterns).astype(np.int32),
     }
     a = {k: wp.array(v, device=device) for k, v in arrays.items()}
     factor = wp.zeros(2 * ld * stride, dtype=wp.float32, device=device)
     response = wp.zeros(2 * ld * stride, dtype=wp.float32, device=device)
-    inputs = [a["dim"], a["njc"], a["mio"], a["ld"], a["vio"], a["P"], a["L"], a["perm"], True, a["rmio"],
-              a["stride"], a["coupling"], factor, response]
-    return inputs, factor, response, max(nu)
+    inputs = [
+        a["dim"],
+        a["njc"],
+        a["mio"],
+        a["ld"],
+        a["vio"],
+        a["P"],
+        a["L"],
+        a["perm"],
+        True,
+        a["rmio"],
+        a["stride"],
+        a["coupling"],
+        factor,
+        response,
+    ]
+    pattern_inputs = [block_sparse, a["tpo"], a["pattern"], bs]
+    return inputs, pattern_inputs, factor, response, max(nu)
+
+
+def _rcm_matrices(seed=3):
+    """SPD blocks whose RCM order is the same on CPU and Metal (unique BFS levels or a dense graph)."""
+    rng = np.random.default_rng(seed)
+
+    def block_diagonal(n, block):
+        A = np.zeros((n, n))
+        for s in range(0, n, block):
+            e = min(n, s + block)
+            m = rng.standard_normal((e - s, e - s))
+            A[s:e, s:e] = m @ m.T + (e - s) * np.eye(e - s)
+        p = rng.permutation(n)
+        return A[np.ix_(p, p)].astype(np.float32)
+
+    m = rng.standard_normal((40, 40))
+    return [
+        block_diagonal(90, 5),
+        block_diagonal(37, 5),
+        (m @ m.T + 40 * np.eye(40)).astype(np.float32),
+        np.eye(1, dtype=np.float32),
+    ]
+
+
+def _rcm_solve(device, mats, capacity_stride):
+    """Factor and solve with :class:`LLTBlockedRCMSolver`; returns (P, L, x from solve, x from solve_inplace)."""
+    dims = [m.shape[0] for m in mats]
+    caps = [(d + 31) // 32 * 32 for d in dims] if capacity_stride else dims
+    info = DenseSquareMultiLinearInfo()
+    info.finalize(dimensions=caps, dtype=wp.float32, device=device)
+    info.dim.assign(np.array(dims, np.int32))
+    if capacity_stride:
+        flat = np.concatenate(
+            [np.pad(m, ((0, c - m.shape[0]), (0, c - m.shape[0]))).ravel() for m, c in zip(mats, caps, strict=True)]
+        )
+    else:
+        flat = np.concatenate([m.ravel() for m in mats])
+    A = wp.array(flat, dtype=wp.float32, device=device)
+    solver = LLTBlockedRCMSolver(
+        operator=DenseLinearOperatorData(info=info, mat=A),
+        capacity_stride=capacity_stride,
+        failed_pivot_shift=1.0e-4,
+        device=device,
+    )
+    solver.compute(A)
+    rhs = np.random.default_rng(5).standard_normal(sum(caps)).astype(np.float32)
+    x = wp.zeros(sum(caps), dtype=wp.float32, device=device)
+    solver.solve(wp.array(rhs, device=device), x)
+    x_inplace = wp.array(rhs, device=device)
+    solver.solve_inplace(x_inplace)
+    return solver.P.numpy(), solver.L.numpy(), x.numpy(), x_inplace.numpy()
 
 
 def _compact_schur_rollout(device, steps=4):
@@ -383,36 +479,51 @@ class TestKaminoMetalLanes(unittest.TestCase):
                     )
 
     def test_bilateral_response_columns_match_one_lane(self):
-        results = {}
-        for name, device, kernel in (
-            ("cpu", "cpu", _solve_bilateral_unilateral_response),
-            ("metal_1", self.metal, _solve_bilateral_unilateral_response),
-            ("metal_columns", self.metal, _solve_bilateral_unilateral_response_columns),
-        ):
-            inputs, factor, response, max_nu = _response_problem(device)
-            if kernel is _solve_bilateral_unilateral_response:
-                wp.launch(kernel, dim=2, inputs=inputs, device=device, block_dim=1)
-            else:
-                wp.launch(kernel, dim=(2, max_nu), inputs=inputs, device=device, block_dim=256)
-            results[name] = (factor.numpy(), response.numpy())
-        self.assertGreater(np.abs(results["cpu"][1]).max(), 0.1)
-        for a, b in zip(results["metal_columns"], results["metal_1"]):
-            np.testing.assert_array_equal(a, b)
-        for a, b in zip(results["metal_columns"], results["cpu"]):
-            np.testing.assert_allclose(a, b, rtol=1e-4, atol=1e-5)
+        for block_sparse in (False, True):
+            results = {}
+            for name, device, kernel in (
+                ("cpu", "cpu", _solve_bilateral_unilateral_response),
+                ("metal_1", self.metal, _solve_bilateral_unilateral_response),
+                ("metal_columns", self.metal, _solve_bilateral_unilateral_response_columns),
+            ):
+                inputs, pattern_inputs, factor, response, max_nu = _response_problem(device, block_sparse)
+                if kernel is _solve_bilateral_unilateral_response:
+                    wp.launch(kernel, dim=2, inputs=inputs, device=device, block_dim=1)
+                else:
+                    wp.launch(kernel, dim=(2, max_nu), inputs=inputs + pattern_inputs, device=device, block_dim=256)
+                results[name] = (factor.numpy(), response.numpy())
+            self.assertGreater(np.abs(results["cpu"][1]).max(), 0.1)
+            # Skipped terms are exact zeros: equal values (a zero may differ in sign).
+            for a, b in zip(results["metal_columns"], results["metal_1"], strict=True):
+                np.testing.assert_array_equal(a, b, err_msg=f"block_sparse={block_sparse}")
+            for a, b in zip(results["metal_columns"], results["cpu"], strict=True):
+                np.testing.assert_allclose(a, b, rtol=1e-4, atol=1e-5)
+
+    def test_rcm_blocked_cholesky_matches_cpu_bitwise(self):
+        # The Metal kernels reproduce the CPU tile kernels' arithmetic order (fmaf tile dot
+        # products, scalar Cholesky, dividing solves), so with the same RCM order the factor
+        # and both solves are bit-identical to CPU.
+        mats = _rcm_matrices()
+        for capacity_stride in (True, False):
+            cpu = _rcm_solve("cpu", mats, capacity_stride)
+            metal = _rcm_solve(self.metal, mats, capacity_stride)
+            np.testing.assert_array_equal(metal[0], cpu[0])
+            for a, b in zip(metal[1:], cpu[1:], strict=True):
+                self.assertGreater(np.abs(b).max(), 0.01)
+                np.testing.assert_array_equal(a, b, err_msg=f"capacity_stride={capacity_stride}")
 
     def test_sparse_pgs_wide_block_matches_one_lane(self):
-        # One lane first: a kernel object keeps the block model it gets at 128 threads.
+        # One lane first: a kernel object keeps the block model it gets at 256 threads.
         with mock.patch.object(dvi_sparse, "_metal_sparse_inequality_pgs_threads", lambda num_worlds: 1):
             qd_1 = _compact_schur_rollout(self.metal)
-        qd_128 = _compact_schur_rollout(self.metal)
+        qd_256 = _compact_schur_rollout(self.metal)
         qd_cpu = _compact_schur_rollout("cpu")
         kernel = dvi_sparse._solve_dvi_sparse_inequalities_pgs
-        self.assertEqual(getattr(kernel._metal_artifact, "coop_block_n", 0), 128)
+        self.assertEqual(getattr(kernel._metal_artifact, "coop_block_n", 0), 256)
         self.assertGreater(np.abs(qd_cpu).max(), 1e-3)
         # Lanes accumulate shared updates with atomics: equal within tolerance, not bitwise.
-        np.testing.assert_allclose(qd_128, qd_1, rtol=0.0, atol=2e-6)
-        np.testing.assert_allclose(qd_128, qd_cpu, rtol=0.0, atol=2e-6)
+        np.testing.assert_allclose(qd_256, qd_1, rtol=0.0, atol=2e-6)
+        np.testing.assert_allclose(qd_256, qd_cpu, rtol=0.0, atol=2e-6)
 
     def test_sparse_contact_pgs_wide_block_matches_one_lane(self):
         with mock.patch.object(dvi_sparse, "_metal_sparse_contact_pgs_threads", lambda: 1):
