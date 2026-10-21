@@ -7765,6 +7765,47 @@ def test_metal_contact_overflow_warns_once(test, device):
     test.assertEqual(len(_overflow_warnings(caught)), 1)
 
 
+def test_metal_overflow_finalizer_never_syncs(test, device):
+    """The overflow monitor's GC finalizer reads without a sync, and skips the MLX path (which needs one)."""
+    from newton._src.geometry import narrow_phase_metal  # noqa: PLC0415
+
+    def recorded_monitor():
+        # The host-side logic only needs a host-addressable flags array.
+        monitor = narrow_phase_metal.MetalBufferOverflowMonitor(device, 80)
+        values = np.zeros((narrow_phase_metal.NUM_OVERFLOW_KINDS, 2), dtype=np.int32)
+        values[10] = (7, 2)  # contact buffer
+        monitor.flags.assign(values)
+        return monitor
+
+    no_sync = (
+        mock.patch.object(wp, "synchronize_device", side_effect=AssertionError("finalizer synchronized")),
+        mock.patch.object(wp.array, "numpy", side_effect=AssertionError("finalizer read with a sync")),
+    )
+
+    monitor = recorded_monitor()
+    with warnings.catch_warnings(record=True) as caught, no_sync[0], no_sync[1]:
+        warnings.simplefilter("always")
+        monitor._finalizer()
+    msgs = _overflow_warnings(caught)
+    test.assertEqual(len(msgs), 1, msgs)
+    test.assertTrue(msgs[0].startswith("Contact buffer overflowed 7 > 2."), msgs)
+
+    monitor = recorded_monitor()
+    with warnings.catch_warnings(record=True) as caught, no_sync[0], no_sync[1]:
+        warnings.simplefilter("always")
+        with mock.patch.object(wp.config, "metal_native_dispatch", False, create=True):
+            monitor._finalizer()
+    test.assertEqual(_overflow_warnings(caught), [])
+
+
+add_function_test(
+    TestCollisionPipeline,
+    "test_metal_overflow_finalizer_never_syncs",
+    test_metal_overflow_finalizer_never_syncs,
+    devices=["cpu"],
+)
+
+
 _metal_devices = [d for d in get_test_devices() if getattr(wp.get_device(d), "is_metal", False)]
 add_function_test(
     TestCollisionPipeline,
