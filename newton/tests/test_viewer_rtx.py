@@ -485,6 +485,54 @@ class TestViewerRTXPrimWorldMatrices(unittest.TestCase):
             np.testing.assert_allclose(out.numpy()[row], expected.T, atol=1.0e-5)
 
 
+def _metal_device():
+    """The first Metal device Warp registered, or ``None``."""
+    return next((d for d in wp.get_devices() if getattr(d, "is_metal", False)), None)
+
+
+@unittest.skipUnless(_metal_device() is not None, "needs a Metal device")
+class TestViewerRTXMatricesMetalMatchesCpu(unittest.TestCase):
+    """``write_prim_world_matrices`` stores ``mat44d`` through software fp64 on Metal; it must match CPU.
+
+    The kernel composes in float32 and widens on store, and the widening is
+    exact, so the two devices agree to float32 rounding of the composition.
+    """
+
+    def _run(self, device):
+        from newton._src.viewer.viewer_rtx import write_prim_world_matrices  # noqa: PLC0415
+
+        rng = np.random.default_rng(1)
+        n = 9
+        quats = rng.normal(size=(n, 4))
+        quats /= np.linalg.norm(quats, axis=1, keepdims=True)
+        xforms = np.concatenate([rng.normal(size=(n, 3)), quats], axis=1).astype(np.float32)
+        with wp.ScopedDevice(device):
+            out = wp.zeros(n + 1, dtype=wp.mat44d)
+            layer = wp.transform(wp.vec3(0.3, -1.0, 2.0), wp.quat(*quats[0].astype(np.float32)))
+            wp.launch(
+                write_prim_world_matrices,
+                dim=n,
+                inputs=[
+                    wp.array(xforms, dtype=wp.transform),
+                    wp.array(rng.integers(-1, n, size=n), dtype=int),
+                    wp.array(rng.normal(size=(n, 3, 3)).astype(np.float32), dtype=wp.mat33),
+                    wp.array(rng.normal(size=(n, 3)).astype(np.float32), dtype=wp.vec3),
+                    wp.array(rng.integers(-1, 4, size=n), dtype=int),
+                    wp.array(rng.normal(size=(3, 3)).astype(np.float32), dtype=wp.vec3),
+                    layer,
+                    1,
+                ],
+                outputs=[out],
+            )
+            return out.numpy()
+
+    def test_prim_world_matrices_match_cpu(self):
+        ref = self._run("cpu")
+        got = self._run(_metal_device())
+        np.testing.assert_array_equal(got[0], ref[0])  # row before the offset stays untouched
+        np.testing.assert_allclose(got, ref, rtol=1e-6, atol=1e-6)
+
+
 @unittest.skipUnless(OVRTX_AVAILABLE, "Requires ovrtx")
 class TestViewerRTXRenderSettings(unittest.TestCase):
     def test_render_settings_override_render_product_attributes(self):

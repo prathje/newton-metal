@@ -22,6 +22,7 @@ import warp as wp
 
 import newton
 from newton._src.actuators.utils import load_metadata
+from newton._src.utils.device import is_metal
 from newton._src.utils.import_usd import parse_usd
 from newton.actuators import (
     Actuator,
@@ -5507,6 +5508,146 @@ class TestControlTargetAttrDefaults(unittest.TestCase):
         actuator = self._actuator(control_target_pos_attr="my_pos", control_target_vel_attr="my_vel")
         self.assertEqual(actuator.control_target_pos_attr, "my_pos")
         self.assertEqual(actuator.control_target_vel_attr, "my_vel")
+
+
+def _metal_device() -> wp.Device | None:
+    """The first Metal device Warp registered, or ``None``."""
+    for dev in wp.get_devices():
+        if is_metal(dev):
+            return dev
+    return None
+
+
+@unittest.skipUnless(_metal_device() is not None, "needs a Metal device")
+class TestImplicitMetalMatchesCpu(unittest.TestCase):
+    """The implicit solve on Metal (software fp64) must reproduce the CPU solve.
+
+    The solve keeps its Newton iterate in ``float64``; Metal emulates binary64
+    with correctly rounded ``+ - * /``. The ``float32`` response ``A`` is
+    computed on each device and differs by float32 rounding, so the end-to-end
+    case uses a float32-level tolerance; the exactness case feeds the CPU's
+    ``A`` to the Metal solve and requires the ``float64`` impulses to agree to
+    within a few ulps.
+    """
+
+    def _run_pid(
+        self,
+        device: wp.Device,
+        states: list[tuple[np.ndarray, np.ndarray]],
+        inverse_blocks: list[np.ndarray] | None = None,
+    ) -> list[tuple]:
+        model = _build_two_link(device, worlds=3)
+        n = model.joint_dof_count
+
+        def _f(vals) -> wp.array[float]:
+            return wp.array(np.asarray(vals, dtype=np.float32), dtype=wp.float32, device=device)
+
+        clamping = [
+            ClampingPositionBased(lookup_positions=(-1.0, 0.0, 1.0), lookup_efforts=(40.0, 60.0, 30.0)),
+            ClampingDCMotor(
+                saturation_effort=_f([80.0] * n), velocity_limit=_f([6.0] * n), max_motor_effort=_f([50.0] * n)
+            ),
+            ClampingMaxEffort(max_effort=_f([45.0] * n)),
+        ]
+        drive = DrivePID(
+            kp=_f(np.linspace(2.0e3, 9.0e3, n)),
+            ki=_f([5.0] * n),
+            kd=_f(np.linspace(20.0, 90.0, n)),
+            integral_max=_f([10.0] * n),
+            const_effort=_f([1.5] * n),
+        )
+        response = JointSpaceResponse(model)
+        actuator = Actuator(
+            indices=wp.array(np.arange(n), dtype=wp.uint32, device=device),
+            drive=drive,
+            clamping=clamping,
+            control_target_pos_attr="joint_target_q",
+            control_target_vel_attr="joint_target_qd",
+        )
+        actuator.set_effort_mode_implicit(response=response, options=Actuator.ImplicitOptions(max_iters=8))
+        state = model.state()
+        control = model.control()
+        control.joint_target_q.assign(np.linspace(-0.8, 0.8, n).astype(np.float32))
+        sa, sb = actuator.state(), actuator.state()
+        out = []
+        for k, (q, qd) in enumerate(states):
+            state.joint_q.assign(q)
+            state.joint_qd.assign(qd)
+            response.refresh(state)
+            if inverse_blocks is not None:
+                response.inverse_blocks.assign(inverse_blocks[k])
+            control.joint_f.zero_()
+            actuator.step(state, control, sa, sb, dt=0.01)
+            sa, sb = sb, sa
+            out.append(
+                (
+                    actuator._effort_mode._pbuf.numpy().copy(),
+                    control.joint_f.numpy().copy(),
+                    response.inverse_blocks.numpy().copy(),
+                )
+            )
+        return out
+
+    @staticmethod
+    def _states() -> list[tuple[np.ndarray, np.ndarray]]:
+        rng = np.random.default_rng(3)
+        n = 6
+        return [
+            (rng.uniform(-1.2, 1.2, n).astype(np.float32), rng.uniform(-8.0, 8.0, n).astype(np.float32))
+            for _ in range(6)
+        ]
+
+    def test_pid_with_clamps_matches_cpu(self):
+        states = self._states()
+        ref = self._run_pid(wp.get_device("cpu"), states)
+        got = self._run_pid(_metal_device(), states)
+        for step, ((p_ref, f_ref, _), (p_got, f_got, _)) in enumerate(zip(ref, got, strict=True)):
+            np.testing.assert_allclose(p_got, p_ref, rtol=1e-5, atol=1e-7, err_msg=f"impulse, step {step}")
+            # Stiff gains (kp up to 9e3) amplify the float32 rounding of A.
+            np.testing.assert_allclose(f_got, f_ref, rtol=2e-4, atol=1e-4, err_msg=f"effort, step {step}")
+
+    def test_pid_with_clamps_fp64_solve_is_exact(self):
+        states = self._states()
+        ref = self._run_pid(wp.get_device("cpu"), states)
+        got = self._run_pid(_metal_device(), states, inverse_blocks=[r[2] for r in ref])
+        for step, ((p_ref, f_ref, _), (p_got, f_got, _)) in enumerate(zip(ref, got, strict=True)):
+            np.testing.assert_allclose(p_got, p_ref, rtol=1e-14, atol=1e-15, err_msg=f"impulse, step {step}")
+            np.testing.assert_array_equal(f_got, f_ref, err_msg=f"effort, step {step}")
+
+    @unittest.skipUnless(_HAS_ONNX and _HAS_WARP_NN, "onnx or warp-nn not installed")
+    def test_neural_mlp_multi_world_matches_cpu(self):
+        """A batched MLP linearization (partial network tiles) solves the same on Metal and CPU."""
+        tmp_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp_dir, ignore_errors=True)
+        path = os.path.join(tmp_dir, "mlp.onnx")
+        _build_mlp_onnx(path, np.array([[30.0, 4.0]], dtype=np.float32), np.array([1.5], dtype=np.float32))
+
+        def run(device):
+            model = _build_two_link(device, worlds=3)
+            n = model.joint_dof_count
+            rng = np.random.default_rng(0)
+            state = model.state()
+            state.joint_q.assign(rng.uniform(-1.0, 1.0, n).astype(np.float32))
+            state.joint_qd.assign(rng.uniform(-3.0, 3.0, n).astype(np.float32))
+            control = model.control()
+            drive = DriveNeuralMLP(model_path=path)
+            response = JointSpaceResponse(model)
+            actuator = Actuator(
+                indices=wp.array(np.arange(n), dtype=wp.uint32, device=device),
+                drive=drive,
+                control_target_pos_attr="joint_target_q",
+                control_target_vel_attr="joint_target_qd",
+            )
+            actuator.set_effort_mode_implicit(response=response)
+            response.refresh(state)
+            control.joint_f.zero_()
+            actuator.step(state, control, actuator.state(), actuator.state(), dt=0.01)
+            return drive._lin_params.numpy(), control.joint_f.numpy()
+
+        (pack_ref, f_ref), (pack_got, f_got) = run(wp.get_device("cpu")), run(_metal_device())
+        self.assertTrue(np.all(pack_ref[:, 2] != 0.0), "every DOF must have a velocity slope")
+        np.testing.assert_allclose(pack_got, pack_ref, rtol=1e-5, atol=1e-5)
+        np.testing.assert_allclose(f_got, f_ref, rtol=1e-4, atol=1e-4)
 
 
 if __name__ == "__main__":
