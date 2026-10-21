@@ -368,7 +368,9 @@ def _solve_bilateral_unilateral_response_columns(
     (``use_pattern``; the factorization clears them), rows above the column's
     first nonzero coupling entry (their forward solution is zero) and tiles
     whose partial solution is still all zero. Removing ``x - 0 * y`` terms
-    keeps every value; at most the sign of a zero result can differ.
+    keeps every value; at most the sign of a zero result can differ. A zero or
+    non-finite pivot (a failed factorization) or right-hand side turns every
+    skip off, so NaNs reach the same entries as in the one-lane kernel.
     """
     wid, unilateral = wp.tid()
     njc = problem_njc[wid]
@@ -382,17 +384,27 @@ def _solve_bilateral_unilateral_response_columns(
     unilateral_stride = response_stride[wid]
     bs = wp.max(block_size, int32(1))
     tiles = (njc + bs - int32(1)) / bs
-    tile_offset = int32(0)
-    if use_pattern:
-        tile_offset = tile_pattern_offsets[wid]
 
+    # First row with a nonzero right-hand side, and whether the right-hand side
+    # and every pivot are finite and nonzero (otherwise skip nothing: 0 * NaN is NaN).
     first_row = njc
+    finite = bool(True)
     for row in range(njc):
         original_row = row
         if use_permutation:
             original_row = bilateral_permutation[bvio + row]
-        if first_row == njc and coupling[offset + original_row * unilateral_stride + unilateral] != float32(0.0):
+        rhs = bilateral_P[bvio + original_row] * coupling[offset + original_row * unilateral_stride + unilateral]
+        if first_row == njc and rhs != float32(0.0):
             first_row = row
+        pivot = bilateral_L[factor + ld * row + row]
+        if not (wp.isfinite(rhs) and wp.isfinite(pivot) and pivot != float32(0.0)):
+            finite = False
+    skip_tiles = use_pattern and finite
+    if not finite:
+        first_row = int32(0)
+    tile_offset = int32(0)
+    if skip_tiles:
+        tile_offset = tile_pattern_offsets[wid]
     if first_row == njc:
         for row in range(njc):
             original_row = row
@@ -404,7 +416,7 @@ def _solve_bilateral_unilateral_response_columns(
 
     # Tiles holding a nonzero entry of the partial solution (up to 64 tiles): terms
     # against an all-zero tile are exactly zero and are left out.
-    use_mask = use_pattern and tiles <= int32(64)
+    use_mask = skip_tiles and tiles <= int32(64)
     nonzero_tiles = wp.uint64(0)
     for row in range(first_row):
         response_factor[offset + row * unilateral_stride + unilateral] = float32(0.0)
@@ -417,7 +429,7 @@ def _solve_bilateral_unilateral_response_columns(
         for col_tile in range(first_row / bs, row_tile + int32(1)):
             if use_mask and ((nonzero_tiles >> wp.uint64(col_tile)) & wp.uint64(1)) == wp.uint64(0):
                 continue
-            if not _response_tile_skipped(use_pattern, tile_pattern, tile_offset, tiles, row_tile, col_tile):
+            if not _response_tile_skipped(skip_tiles, tile_pattern, tile_offset, tiles, row_tile, col_tile):
                 k_begin = wp.max(first_row, col_tile * bs)
                 k_end = wp.min(row, (col_tile + int32(1)) * bs)
                 for k in range(k_begin, k_end):
@@ -427,7 +439,7 @@ def _solve_bilateral_unilateral_response_columns(
                     )
         solved = value / bilateral_L[factor + ld * row + row]
         response_factor[offset + row * unilateral_stride + unilateral] = solved
-        if solved != float32(0.0):
+        if use_mask and solved != float32(0.0):
             nonzero_tiles = nonzero_tiles | (wp.uint64(1) << wp.uint64(row_tile))
 
     nonzero_tiles = wp.uint64(0)
@@ -438,7 +450,7 @@ def _solve_bilateral_unilateral_response_columns(
         for row_tile in range(col_tile, tiles):
             if use_mask and ((nonzero_tiles >> wp.uint64(row_tile)) & wp.uint64(1)) == wp.uint64(0):
                 continue
-            if not _response_tile_skipped(use_pattern, tile_pattern, tile_offset, tiles, row_tile, col_tile):
+            if not _response_tile_skipped(skip_tiles, tile_pattern, tile_offset, tiles, row_tile, col_tile):
                 k_begin = wp.max(row + int32(1), row_tile * bs)
                 k_end = wp.min(njc, (row_tile + int32(1)) * bs)
                 for k in range(k_begin, k_end):
@@ -448,7 +460,7 @@ def _solve_bilateral_unilateral_response_columns(
                     )
         solved = value / bilateral_L[factor + ld * row + row]
         response_factor[offset + row * unilateral_stride + unilateral] = solved
-        if solved != float32(0.0):
+        if use_mask and solved != float32(0.0):
             nonzero_tiles = nonzero_tiles | (wp.uint64(1) << wp.uint64(col_tile))
 
     for row in range(njc):
