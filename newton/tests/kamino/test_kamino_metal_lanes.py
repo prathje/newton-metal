@@ -202,12 +202,14 @@ def _dvi_pgs_solve(problem, solver, kernel=None, threads_per_world=None):
         solver.__dict__.pop("_dense_pgs_operator", None)
 
 
-def _response_problem(device, block_sparse=False):
+def _response_problem(device, block_sparse=False, failed=False):
     """Two worlds of bilateral-unilateral response inputs.
 
     ``block_sparse``: the factor is zero outside a random 8x8-tile mask (as the
     RCM factorization leaves it) and some coupling columns are zero or start
     with zero rows; the Metal kernel then skips those terms.
+    ``failed``: world 0 has NaN pivots (a failed factorization), world 1 a zero
+    pivot; the NaNs must reach the entries they reach in the one-lane kernel.
     """
     rng = np.random.default_rng(11)
     njc, nu = [37, 9], [50, 5]
@@ -226,6 +228,9 @@ def _response_problem(device, block_sparse=False):
             L[w, :n, :n] *= mask
         patterns.append(pattern.ravel())
         L[w, np.arange(n), np.arange(n)] = rng.uniform(1.0, 2.0, n)
+    if failed:
+        L[0, 20:, 20] = np.nan
+        L[1, 3, 3] = 0.0
     perm = np.concatenate([np.pad(rng.permutation(n), (0, ld - n)) for n in njc]).astype(np.int32)
     coupling = rng.uniform(-1.0, 1.0, (2, ld, stride)).astype(np.float32)
     if block_sparse:
@@ -491,23 +496,28 @@ class TestKaminoMetalLanes(unittest.TestCase):
                     )
 
     def test_bilateral_response_columns_match_one_lane(self):
-        for block_sparse in (False, True):
+        for block_sparse, failed in ((False, False), (True, False), (True, True)):
             results = {}
             for name, device, kernel in (
                 ("cpu", "cpu", _solve_bilateral_unilateral_response),
                 ("metal_1", self.metal, _solve_bilateral_unilateral_response),
                 ("metal_columns", self.metal, _solve_bilateral_unilateral_response_columns),
             ):
-                inputs, pattern_inputs, factor, response, max_nu = _response_problem(device, block_sparse)
+                inputs, pattern_inputs, factor, response, max_nu = _response_problem(device, block_sparse, failed)
                 if kernel is _solve_bilateral_unilateral_response:
                     wp.launch(kernel, dim=2, inputs=inputs, device=device, block_dim=1)
                 else:
                     wp.launch(kernel, dim=(2, max_nu), inputs=inputs + pattern_inputs, device=device, block_dim=256)
                 results[name] = (factor.numpy(), response.numpy())
-            self.assertGreater(np.abs(results["cpu"][1]).max(), 0.1)
-            # Skipped terms are exact zeros: equal values (a zero may differ in sign).
+            if failed:
+                # Both worlds fail; a skipped 0 * NaN term would leave finite entries.
+                self.assertTrue(np.isnan(results["cpu"][1]).any())
+            else:
+                self.assertGreater(np.abs(results["cpu"][1]).max(), 0.1)
+            # Skipped terms are exact zeros: equal values (a zero may differ in sign), NaNs in
+            # the same places.
             for a, b in zip(results["metal_columns"], results["metal_1"], strict=True):
-                np.testing.assert_array_equal(a, b, err_msg=f"block_sparse={block_sparse}")
+                np.testing.assert_array_equal(a, b, err_msg=f"block_sparse={block_sparse} failed={failed}")
             for a, b in zip(results["metal_columns"], results["cpu"], strict=True):
                 np.testing.assert_allclose(a, b, rtol=1e-4, atol=1e-5)
 
