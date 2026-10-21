@@ -10,7 +10,6 @@ from collections.abc import Sequence
 import warp as wp
 
 from ......utils.device import is_metal
-
 from ...core.data import DataKamino
 from ...core.model import ModelKamino
 from ...core.types import vec6f
@@ -1548,13 +1547,25 @@ def _solve_sparse_with_bilateral_schur_complement(path: SparseDVIPath, problem: 
             device=path.device,
             block_dim=128,
         )
+    metal_response_inputs = []
     if is_metal(path.device):
-        # One thread per response column instead of one per world (see kernels_metal).
+        # One thread per response column instead of one per world, skipping factor
+        # tiles outside the RCM tile mask (see kernels_metal).
         from .kernels_metal import _solve_bilateral_unilateral_response_columns  # noqa: PLC0415
 
         response_kernel = _solve_bilateral_unilateral_response_columns
         response_dim = (path.size.num_worlds, max(1, max_unilateral_rows))
         response_block_dim = 256
+        if use_permutation:
+            metal_response_inputs = [
+                True,
+                path.bilateral_solver.tile_pattern_offsets,
+                path.bilateral_solver.tile_pattern,
+                path.bilateral_solver.block_size,
+            ]
+        else:
+            # Dense factor: no tile mask (the int32 arrays are placeholders).
+            metal_response_inputs = [False, factor_offsets, factor_offsets, 0]
     wp.launch(
         kernel=response_kernel,
         dim=response_dim,
@@ -1584,6 +1595,7 @@ def _solve_sparse_with_bilateral_schur_complement(path: SparseDVIPath, problem: 
                 if path.device.is_cuda
                 else []
             ),
+            *metal_response_inputs,
         ],
         device=path.device,
         block_dim=response_block_dim,
