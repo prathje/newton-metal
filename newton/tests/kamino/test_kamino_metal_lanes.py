@@ -111,14 +111,28 @@ def _dvi_pgs_builders():
     def kapla():
         return _build_reduced_kapla_tower(layer_count=3)[0]
 
-    # name -> (builder, forced block width or None for the solver's choice)
-    return {
-        "five_box_stacks": (stacks, None),
-        "fourbar_and_boxes": (_padmm_builder, None),
-        # 64 threads for a few hundred rows: every thread owns several rows.
-        "kapla_tower_64_threads": (kapla, 64),
-    }
+    def mixed_worlds():
+        # Worlds of 60 / 56 / 240 rows (not powers of two) in one launch.
+        builder = newton.ModelBuilder()
+        builder.add_world(_build_five_box_stack())
+        builder.add_world(_padmm_builder())
+        builder.add_world(_build_reduced_kapla_tower(layer_count=2)[0])
+        return builder
 
+    # name -> (builder, forced block width or None for the solver's choice, check CPU world totals,
+    #          Warp coop tiles on)
+    return {
+        "five_box_stacks": (stacks, None, True, True),
+        "fourbar_and_boxes": (_padmm_builder, None, True, True),
+        # 64 threads for a few hundred rows: every thread owns several rows.
+        "kapla_tower_64_threads": (kapla, 64, True, True),
+        # CPU emits world 0's contacts in another order, so its 40-iteration PGS stops at a
+        # different unconverged iterate (0.1547 vs 0.1487; both reach 0.14715 = 15 g dt with
+        # 1000+ iterations): no CPU totals check here.
+        "mixed_worlds": (mixed_worlds, None, False, True),
+        # Warp keeps the serial model (block_dim() == 1): lane 0 must sweep the world alone.
+        "five_box_stacks_coop_tiles_off": (stacks, 256, True, False),
+    }
 
 def _dvi_pgs_problem(device, builder_fn):
     """A dense DVI problem with contacts (and, for the four-bar, bilateral joint rows)."""
@@ -325,7 +339,9 @@ class TestKaminoMetalLanes(unittest.TestCase):
         np.testing.assert_allclose(lam_32, lam_c, rtol=1e-3, atol=1e-5)
 
     def test_dvi_dense_pgs_lanes_match_one_lane_bitwise(self):
-        for name, (builder_fn, width) in _dvi_pgs_builders().items():
+        from newton._src.solvers.kamino._src.solvers.dvi.kernels_metal import dense_pgs_rows_kernel  # noqa: PLC0415
+
+        for name, (builder_fn, width, check_cpu, coop_tiles) in _dvi_pgs_builders().items():
             with self.subTest(name):
                 problem, solver = _dvi_pgs_problem(self.metal, builder_fn)
                 ncts = problem.data.dim.numpy()
@@ -334,21 +350,27 @@ class TestKaminoMetalLanes(unittest.TestCase):
                 # kernel with one threadgroup per world (row-owned velocity update: same summation
                 # order).
                 lam_ref, v_ref, n_ref = _dvi_pgs_solve(problem, solver, _solve_dvi_inequalities_colored_pgs, 1)
-                lam_32, v_32, n_32 = _dvi_pgs_solve(problem, solver, threads_per_world=width)
-                self.assertGreater(n_32, 0)
-                # Ran as one real threadgroup per world (Warp's wide-block model), with more
-                # threads than one SIMD group and fewer than the rows.
+                saved = wp.config.metal_coop_tiles
+                wp.config.metal_coop_tiles = coop_tiles
+                try:
+                    lam_m, v_m, n_m = _dvi_pgs_solve(problem, solver, threads_per_world=width)
+                finally:
+                    wp.config.metal_coop_tiles = saved
+                self.assertGreater(n_m, 0)
                 width = width or solver._dense_pgs_threads_per_world()
                 self.assertGreater(width, 32)
                 if name.startswith("kapla"):
                     self.assertGreater(int(ncts.max()), 4 * width)
-                from newton._src.solvers.kamino._src.solvers.dvi.kernels_metal import dense_pgs_rows_kernel
-
-                self.assertEqual(getattr(dense_pgs_rows_kernel(width).adj, "_metal_coop_block_n", 0), width)
-                self.assertEqual(n_ref, n_32)
+                # Wide-block model (one real threadgroup per world), or the serial model when
+                # coop tiles are off.
+                expected_block = width if coop_tiles else 0
+                self.assertEqual(getattr(dense_pgs_rows_kernel(width).adj, "_metal_coop_block_n", 0), expected_block)
+                self.assertEqual(n_ref, n_m)
                 self.assertGreater(np.abs(lam_ref).max(), 0.0)
-                np.testing.assert_array_equal(lam_32, lam_ref)
-                np.testing.assert_array_equal(v_32, v_ref)
+                np.testing.assert_array_equal(lam_m, lam_ref)
+                np.testing.assert_array_equal(v_m, v_ref)
+                if not check_cpu:
+                    continue
                 # CPU: same algorithm and rows, but contacts may come in another order and redundant
                 # contact patches split their load non-uniquely; compare each world's total impulse.
                 problem_c, solver_c = _dvi_pgs_problem("cpu", builder_fn)
@@ -357,8 +379,9 @@ class TestKaminoMetalLanes(unittest.TestCase):
                 vio = problem.data.vio.numpy()
                 for w, (o, n) in enumerate(zip(vio, ncts)):
                     np.testing.assert_allclose(
-                        lam_32[o : o + n].sum(), lam_c[o : o + n].sum(), rtol=2e-3, err_msg=f"world {w}"
+                        lam_m[o : o + n].sum(), lam_c[o : o + n].sum(), rtol=2e-3, err_msg=f"world {w}"
                     )
+
     def test_bilateral_response_columns_match_one_lane(self):
         results = {}
         for name, device, kernel in (

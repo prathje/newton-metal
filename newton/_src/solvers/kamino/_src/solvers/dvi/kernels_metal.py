@@ -85,12 +85,27 @@ def _make_dense_pgs_rows_kernel(width: int):
         needs block reductions, which a barrier-only wide block does not have. Metal never
         enables it; ``enable_adaptive`` only selects whether the status is written.
         """
+        # The launch is dim=num_worlds*width, block_dim=width. Warp runs it as one
+        # threadgroup per world (wide-block model, block_dim() == width) or, if it
+        # keeps the serial model (wp.config.metal_coop_tiles off), as independent
+        # threads with block_dim() == 1: then lane 0 sweeps the whole world alone
+        # (barriers are no-ops), which is the one-lane kernel exactly.
         tid = wp.tid()
-        threads_per_world = int32(wp.block_dim())
-        lane = tid % threads_per_world
-        wid = tid / threads_per_world
-        if threads_per_world != width:
-            return  # unreachable: DVISolver launches it with block_dim=width
+        lane = tid % width
+        wid = tid / width
+        block = int32(wp.block_dim())
+        threads_per_world = int32(width)
+        if block == int32(1):
+            if lane != int32(0):
+                return
+            threads_per_world = int32(1)
+        elif block != int32(width):
+            # Any other block model would silently skip or split the sweep: poison
+            # the world's impulses instead.
+            if lane == int32(0):
+                for row in range(problem_dim[wid]):
+                    solution_lambdas[problem_vio[wid] + row] = wp.nan
+            return
         cfg = solver_config[wid]
         if block_iteration >= int32(0) and block_iteration >= cfg.max_alternating_iterations:
             return
