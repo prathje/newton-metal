@@ -2499,6 +2499,11 @@ class NarrowPhase:
         if speculative and hydroelastic_sdf is not None:
             raise NotImplementedError("Speculative contact generation does not yet support hydroelastic SDF contacts")
         device_obj = wp.get_device(device)
+        # Metal kernels cannot print: overflows go to a flag array that the
+        # host checks lazily (see ``narrow_phase_metal``).
+        self._metal_overflow_monitor = None
+        if verify_buffers and is_metal(device_obj):
+            self._metal_overflow_monitor = _metal_overflow_monitor(device_obj)
         # Contact reduction requires either meshes or heightfields (the
         # mesh/heightfield-triangle path feeds the global reducer, so
         # heightfield-only scenes still benefit from reduction).
@@ -3585,45 +3590,52 @@ class NarrowPhase:
                 split_query_count = self.gjk_candidate_pairs_count
                 max_split_query = -1
 
-            wp.launch(
-                kernel=verify_narrow_phase_buffers,
-                dim=[1],
-                inputs=[
-                    candidate_pair_count,
-                    candidate_pair.shape[0],
-                    split_query_count,
-                    max_split_query,
-                    self.gjk_candidate_pairs_count,
-                    self.gjk_candidate_pairs.shape[0],
-                    self.split_gjk_work_count
-                    if self.split_gjk_work_count is not None
-                    else self.gjk_candidate_pairs_count,
-                    self.split_gjk_work_items.shape[0] if self.split_gjk_work_items is not None else -1,
-                    self.split_manifold_work_count
-                    if self.split_manifold_work_count is not None
-                    else self.gjk_candidate_pairs_count,
-                    self.split_manifold_work_items.shape[0] if self.split_manifold_work_items is not None else -1,
-                    self.shape_pairs_mesh_count,
-                    self.shape_pairs_mesh.shape[0] if self.shape_pairs_mesh is not None else 0,
-                    self.triangle_pairs_count,
-                    self.triangle_pairs.shape[0] if self.triangle_pairs is not None else 0,
-                    self.shape_pairs_mesh_plane_count,
-                    self.shape_pairs_mesh_plane.shape[0] if self.shape_pairs_mesh_plane is not None else 0,
-                    self.shape_pairs_mesh_mesh_count,
-                    self.shape_pairs_mesh_mesh.shape[0] if self.shape_pairs_mesh_mesh is not None else 0,
-                    self.shape_pairs_sdf_sdf_count,
-                    self.shape_pairs_sdf_sdf.shape[0] if self.shape_pairs_sdf_sdf is not None else 0,
-                    writer_data.contact_count,
-                    writer_data.contact_max,
-                    reduction_ht_active_slots,
-                    reduction_ht_capacity,
-                    reduction_ht_insert_failures,
-                    reduction_buffer_overflows,
-                    HASHTABLE_WARN_LOAD_PERCENT,
-                ],
-                device=device,
-                record_tape=False,
-            )
+            verify_inputs = [
+                candidate_pair_count,
+                candidate_pair.shape[0],
+                split_query_count,
+                max_split_query,
+                self.gjk_candidate_pairs_count,
+                self.gjk_candidate_pairs.shape[0],
+                self.split_gjk_work_count
+                if self.split_gjk_work_count is not None
+                else self.gjk_candidate_pairs_count,
+                self.split_gjk_work_items.shape[0] if self.split_gjk_work_items is not None else -1,
+                self.split_manifold_work_count
+                if self.split_manifold_work_count is not None
+                else self.gjk_candidate_pairs_count,
+                self.split_manifold_work_items.shape[0] if self.split_manifold_work_items is not None else -1,
+                self.shape_pairs_mesh_count,
+                self.shape_pairs_mesh.shape[0] if self.shape_pairs_mesh is not None else 0,
+                self.triangle_pairs_count,
+                self.triangle_pairs.shape[0] if self.triangle_pairs is not None else 0,
+                self.shape_pairs_mesh_plane_count,
+                self.shape_pairs_mesh_plane.shape[0] if self.shape_pairs_mesh_plane is not None else 0,
+                self.shape_pairs_mesh_mesh_count,
+                self.shape_pairs_mesh_mesh.shape[0] if self.shape_pairs_mesh_mesh is not None else 0,
+                self.shape_pairs_sdf_sdf_count,
+                self.shape_pairs_sdf_sdf.shape[0] if self.shape_pairs_sdf_sdf is not None else 0,
+                writer_data.contact_count,
+                writer_data.contact_max,
+                reduction_ht_active_slots,
+                reduction_ht_capacity,
+                reduction_ht_insert_failures,
+                reduction_buffer_overflows,
+                HASHTABLE_WARN_LOAD_PERCENT,
+            ]
+            if is_metal(device):
+                monitor = self._metal_overflow_monitor
+                if monitor is None or monitor.device != wp.get_device(device):
+                    self._metal_overflow_monitor = _metal_overflow_monitor(device)
+                self._metal_overflow_monitor.launch(verify_inputs)
+            else:
+                wp.launch(
+                    kernel=verify_narrow_phase_buffers,
+                    dim=[1],
+                    inputs=verify_inputs,
+                    device=device,
+                    record_tape=False,
+                )
 
     def launch(
         self,
@@ -3831,3 +3843,9 @@ class NarrowPhase:
                 contact_tangent=contact_tangent,
                 device=device,
             )
+
+
+def _metal_overflow_monitor(device):
+    from .narrow_phase_metal import MetalBufferOverflowMonitor  # noqa: PLC0415
+
+    return MetalBufferOverflowMonitor(device, HASHTABLE_WARN_LOAD_PERCENT)
