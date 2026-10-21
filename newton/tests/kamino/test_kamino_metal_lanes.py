@@ -13,8 +13,9 @@
   CUDA/CPU kernel bit for bit, and match the CPU solve within tolerance.
 - The bilateral-unilateral response (sparse Schur DVI) runs one thread per column on Metal; it must
   match the one-lane kernel bit for bit and the CPU kernel within tolerance.
-- The general sparse PGS kernel runs as one 128-thread threadgroup per world on Metal (wide blocks);
-  lanes accumulate with atomics, so it must match one lane and CPU within tolerance.
+- The general sparse PGS kernel runs as one 128-thread threadgroup per world on Metal (wide blocks),
+  the contact-only one with 64 threads; lanes accumulate with atomics, so both must match one lane and
+  CPU within tolerance.
 """
 
 import unittest
@@ -264,6 +265,31 @@ def _compact_schur_rollout(device, steps=4):
     return np.array(out)
 
 
+def _sparse_kapla_rollout(device, steps=12):
+    """A short sparse DVI rollout of a reduced kapla tower (contact-only sparse PGS); returns body_q per step."""
+    builder, _bodies, _ = _build_reduced_kapla_tower(layer_count=3)
+    model = builder.finalize(device=device)
+    config = SolverKamino.Config(
+        dynamics_solver="dvi",
+        use_collision_detector=True,
+        sparse_dynamics=True,
+        sparse_jacobian=True,
+        collision_detector=kamino_config.CollisionDetectorConfig(
+            max_contacts=256, max_contacts_per_world=256, max_contacts_per_pair=8
+        ),
+    )
+    solver = SolverKamino(model, config=config)
+    state_0, state_1 = model.state(), model.state()
+    impulse, qd = [], []
+    for _ in range(steps):
+        solver.step(state_0, state_1, control=None, contacts=None, dt=1.0e-3)
+        state_0, state_1 = state_1, state_0
+        # Total impulse: independent of the (device-dependent) contact order.
+        impulse.append(float(solver._solver_kamino.solver_fd.data.solution.lambdas.numpy().astype(np.float64).sum()))
+        qd.append(state_0.body_qd.numpy().copy())
+    return np.array(impulse), np.array(qd)
+
+
 class TestKaminoMetalLanes(unittest.TestCase):
     def setUp(self):
         if not test_context.setup_done:
@@ -364,6 +390,20 @@ class TestKaminoMetalLanes(unittest.TestCase):
         # Lanes accumulate shared updates with atomics: equal within tolerance, not bitwise.
         np.testing.assert_allclose(qd_128, qd_1, rtol=0.0, atol=2e-6)
         np.testing.assert_allclose(qd_128, qd_cpu, rtol=0.0, atol=2e-6)
+
+    def test_sparse_contact_pgs_wide_block_matches_one_lane(self):
+        with mock.patch.object(dvi_sparse, "_metal_sparse_contact_pgs_threads", lambda: 1):
+            imp_1, qd_1 = _sparse_kapla_rollout(self.metal)
+        imp_64, qd_64 = _sparse_kapla_rollout(self.metal)
+        imp_cpu, qd_cpu = _sparse_kapla_rollout("cpu")
+        kernel = dvi_sparse._solve_dvi_sparse_contacts_pgs
+        self.assertEqual(getattr(kernel._metal_artifact, "coop_block_n", 0), 64)
+        self.assertGreater(imp_cpu.min(), 0.0)
+        # Lanes reorder atomic updates: equal within tolerance, not bitwise.
+        np.testing.assert_allclose(imp_64, imp_1, rtol=1e-4)
+        np.testing.assert_allclose(imp_64, imp_cpu, rtol=1e-4)
+        np.testing.assert_allclose(qd_64, qd_1, rtol=0.0, atol=1e-5)
+        np.testing.assert_allclose(qd_64, qd_cpu, rtol=0.0, atol=1e-5)
 
 
 if __name__ == "__main__":
