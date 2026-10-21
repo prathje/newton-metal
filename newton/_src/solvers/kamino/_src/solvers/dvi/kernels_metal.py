@@ -365,10 +365,10 @@ def _solve_bilateral_unilateral_response_columns(
     lanes (one on CPU); columns are independent, so here each thread solves
     one column with the same arithmetic in the same order, leaving out only
     terms that are exactly zero: factor tiles outside the RCM tile mask
-    (``use_pattern``; the factorization clears them) and, in the forward
-    solve, rows above the column's first nonzero coupling entry (their
-    solution is zero). Removing ``x - 0 * y`` terms keeps every value; at most
-    the sign of a zero result can differ.
+    (``use_pattern``; the factorization clears them), rows above the column's
+    first nonzero coupling entry (their forward solution is zero) and tiles
+    whose partial solution is still all zero. Removing ``x - 0 * y`` terms
+    keeps every value; at most the sign of a zero result can differ.
     """
     wid, unilateral = wp.tid()
     njc = problem_njc[wid]
@@ -402,6 +402,10 @@ def _solve_bilateral_unilateral_response_columns(
             response[offset + original_row * unilateral_stride + unilateral] = float32(0.0)
         return
 
+    # Tiles holding a nonzero entry of the partial solution (up to 64 tiles): terms
+    # against an all-zero tile are exactly zero and are left out.
+    use_mask = use_pattern and tiles <= int32(64)
+    nonzero_tiles = wp.uint64(0)
     for row in range(first_row):
         response_factor[offset + row * unilateral_stride + unilateral] = float32(0.0)
     for row in range(first_row, njc):
@@ -411,6 +415,8 @@ def _solve_bilateral_unilateral_response_columns(
         value = bilateral_P[bvio + original_row] * coupling[offset + original_row * unilateral_stride + unilateral]
         row_tile = row / bs
         for col_tile in range(first_row / bs, row_tile + int32(1)):
+            if use_mask and ((nonzero_tiles >> wp.uint64(col_tile)) & wp.uint64(1)) == wp.uint64(0):
+                continue
             if not _response_tile_skipped(use_pattern, tile_pattern, tile_offset, tiles, row_tile, col_tile):
                 k_begin = wp.max(first_row, col_tile * bs)
                 k_end = wp.min(row, (col_tile + int32(1)) * bs)
@@ -419,13 +425,19 @@ def _solve_bilateral_unilateral_response_columns(
                         bilateral_L[factor + ld * row + k]
                         * response_factor[offset + k * unilateral_stride + unilateral]
                     )
-        response_factor[offset + row * unilateral_stride + unilateral] = value / bilateral_L[factor + ld * row + row]
+        solved = value / bilateral_L[factor + ld * row + row]
+        response_factor[offset + row * unilateral_stride + unilateral] = solved
+        if solved != float32(0.0):
+            nonzero_tiles = nonzero_tiles | (wp.uint64(1) << wp.uint64(row_tile))
 
+    nonzero_tiles = wp.uint64(0)
     for reverse_row in range(njc):
         row = njc - int32(1) - reverse_row
         value = response_factor[offset + row * unilateral_stride + unilateral]
         col_tile = row / bs
         for row_tile in range(col_tile, tiles):
+            if use_mask and ((nonzero_tiles >> wp.uint64(row_tile)) & wp.uint64(1)) == wp.uint64(0):
+                continue
             if not _response_tile_skipped(use_pattern, tile_pattern, tile_offset, tiles, row_tile, col_tile):
                 k_begin = wp.max(row + int32(1), row_tile * bs)
                 k_end = wp.min(njc, (row_tile + int32(1)) * bs)
@@ -434,7 +446,10 @@ def _solve_bilateral_unilateral_response_columns(
                         bilateral_L[factor + ld * k + row]
                         * response_factor[offset + k * unilateral_stride + unilateral]
                     )
-        response_factor[offset + row * unilateral_stride + unilateral] = value / bilateral_L[factor + ld * row + row]
+        solved = value / bilateral_L[factor + ld * row + row]
+        response_factor[offset + row * unilateral_stride + unilateral] = solved
+        if solved != float32(0.0):
+            nonzero_tiles = nonzero_tiles | (wp.uint64(1) << wp.uint64(col_tile))
 
     for row in range(njc):
         original_row = row
