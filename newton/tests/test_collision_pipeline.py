@@ -59,6 +59,7 @@ from newton._src.sim.collide import (
     _estimate_rigid_contact_max,
     write_contact,
 )
+from newton._src.utils.device import supports_cooperative_blocks
 from newton._src.utils.heightfield import HeightfieldData
 from newton.examples import test_body_state
 from newton.geometry import BroadPhaseAllPairs, BroadPhaseExplicit, NarrowPhase
@@ -5270,12 +5271,14 @@ def test_mesh_query_tile_width_follows_geometry(test, device):
     heightfield_model = heightfield_builder.finalize(device=device)
     heightfield_pipeline = newton.CollisionPipeline(heightfield_model, broad_phase="nxn")
 
-    if wp.get_device(device).is_cpu:
-        test.assertEqual(mesh_pipeline.narrow_phase.tile_size_mesh_convex, 1)
-        test.assertEqual(heightfield_pipeline.narrow_phase.tile_size_mesh_convex, 1)
-    else:
+    # Wide tiles need lanes that cooperate on a block (CUDA). CPU and Metal run
+    # these tile kernels with one lane per block, so the width stays 1 there.
+    if supports_cooperative_blocks(device):
         test.assertEqual(mesh_pipeline.narrow_phase.tile_size_mesh_convex, 256)
         test.assertEqual(heightfield_pipeline.narrow_phase.tile_size_mesh_convex, 128)
+    else:
+        test.assertEqual(mesh_pipeline.narrow_phase.tile_size_mesh_convex, 1)
+        test.assertEqual(heightfield_pipeline.narrow_phase.tile_size_mesh_convex, 1)
 
 
 add_function_test(
