@@ -554,12 +554,18 @@ def _prepare_sparse_inequality_pgs(path: SparseDVIPath, problem: DualProblem) ->
 
 
 def _metal_sparse_inequality_pgs_threads(num_worlds: int) -> int:
-    """Block width of the general sparse PGS kernel on Metal: CUDA's widths.
+    """Block width of the general sparse PGS kernel on Metal.
 
     Warp's Metal backend runs this barrier-synchronised kernel as one
     threadgroup per world (wide-block model) instead of one thread per world.
+    A few large worlds leave the GPU idle, so they get wider blocks; many
+    worlds fill it and run faster with narrow ones (2 worlds of 685 joint rows:
+    256 threads 5.3 ms vs 128 threads 8.3 ms; 128 worlds of 100 rows: 64
+    threads 1.2 ms vs 256 threads 1.8 ms).
     """
-    return 128 if num_worlds <= 512 else 64
+    if num_worlds <= 16:
+        return 256
+    return 128 if num_worlds <= 64 else 64
 
 
 def _metal_sparse_contact_pgs_threads() -> int:
