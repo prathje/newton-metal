@@ -163,6 +163,19 @@ def _peek(flags: wp.array) -> np.ndarray:
     return np.frombuffer(raw, dtype=np.int32, count=n).reshape(flags.shape).copy()
 
 
+def _report_from_finalizer(flags: wp.array, warned: set[str], warn_load_percent: int) -> None:
+    """Finalizer variant of :func:`_report` that never synchronizes.
+
+    A garbage collection can run the finalizer anywhere, including inside a
+    graph capture or a Warp-internal locked section, where a sync could fail
+    or deadlock. The MLX path can only read the flags with a sync, so it
+    skips the report there.
+    """
+    if not getattr(wp.config, "metal_native_dispatch", True):
+        return
+    _report(flags, warned, warn_load_percent)
+
+
 def _report(flags: wp.array, warned: set[str], warn_load_percent: int) -> None:
     values = _peek(flags)
     for kind, (key, template) in enumerate(_KINDS):
@@ -189,7 +202,7 @@ class MetalBufferOverflowMonitor:
         self.warned: set[str] = set()
         # Overflows recorded during graph replays (no eager launch follows) are
         # reported when the narrow phase goes away.
-        self._finalizer = weakref.finalize(self, _report, self.flags, self.warned, warn_load_percent)
+        self._finalizer = weakref.finalize(self, _report_from_finalizer, self.flags, self.warned, warn_load_percent)
 
     def poll(self, synchronize: bool = False) -> None:
         """Warn for overflow kinds recorded so far (once per kind).
