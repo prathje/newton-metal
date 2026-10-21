@@ -15,7 +15,8 @@
   exactly-zero terms (RCM tile mask, zero coupling rows, all-zero solution tiles); it must match the
   one-lane kernel bit for bit and the CPU kernel within tolerance.
 - :class:`LLTBlockedRCMSolver` uses tile-free factorize/solve kernels on Metal
-  (``llt_blocked_rcm_metal``); with the same RCM order its factor and solutions are bit-identical to CPU.
+  (``llt_blocked_rcm_metal``) and an in-order RCM traversal (``rcm_batch_metal``); permutation, factor
+  and solutions are bit-identical to CPU.
 - The general sparse PGS kernel runs as one 256-thread threadgroup per world on Metal for a few worlds
   (wide blocks),
   the contact-only one with 64 threads; lanes accumulate with atomics, so both must match one lane and
@@ -273,8 +274,16 @@ def _response_problem(device, block_sparse=False):
 
 
 def _rcm_matrices(seed=3):
-    """SPD blocks whose RCM order is the same on CPU and Metal (unique BFS levels or a dense graph)."""
+    """Shuffled SPD blocks: block-diagonal (Kamino joint rows), banded, random sparse, dense and 1x1.
+
+    Banded and random sparse graphs have BFS levels with several vertices, whose order the
+    atomic GPU traversal used to change from run to run.
+    """
     rng = np.random.default_rng(seed)
+
+    def shuffled(A):
+        p = rng.permutation(A.shape[0])
+        return A[np.ix_(p, p)].astype(np.float32)
 
     def block_diagonal(n, block):
         A = np.zeros((n, n))
@@ -282,14 +291,17 @@ def _rcm_matrices(seed=3):
             e = min(n, s + block)
             m = rng.standard_normal((e - s, e - s))
             A[s:e, s:e] = m @ m.T + (e - s) * np.eye(e - s)
-        p = rng.permutation(n)
-        return A[np.ix_(p, p)].astype(np.float32)
+        return shuffled(A)
 
-    m = rng.standard_normal((40, 40))
+    band = np.tril(np.triu(rng.standard_normal((70, 70)), -6), 6)
+    sparse = rng.standard_normal((80, 80)) * (rng.random((80, 80)) < 0.04)
+    dense = rng.standard_normal((40, 40))
     return [
         block_diagonal(90, 5),
         block_diagonal(37, 5),
-        (m @ m.T + 40 * np.eye(40)).astype(np.float32),
+        shuffled(band @ band.T + 7.0 * np.eye(70)),
+        shuffled(sparse @ sparse.T + 16.0 * np.eye(80)),
+        (dense @ dense.T + 40 * np.eye(40)).astype(np.float32),
         np.eye(1, dtype=np.float32),
     ]
 
@@ -500,9 +512,9 @@ class TestKaminoMetalLanes(unittest.TestCase):
                 np.testing.assert_allclose(a, b, rtol=1e-4, atol=1e-5)
 
     def test_rcm_blocked_cholesky_matches_cpu_bitwise(self):
-        # The Metal kernels reproduce the CPU tile kernels' arithmetic order (fmaf tile dot
-        # products, scalar Cholesky, dividing solves), so with the same RCM order the factor
-        # and both solves are bit-identical to CPU.
+        # Metal traverses the RCM graph in the CPU's order, and its factorize/solve kernels
+        # reproduce the CPU tile kernels' arithmetic order (fmaf tile dot products, scalar
+        # Cholesky, dividing solves): permutation, factor and both solves are bit-identical.
         mats = _rcm_matrices()
         for capacity_stride in (True, False):
             cpu = _rcm_solve("cpu", mats, capacity_stride)

@@ -59,6 +59,8 @@ from functools import cache
 
 import warp as wp
 
+from ......utils.device import is_metal
+
 
 @wp.func_native("""
 #if defined(__CUDA_ARCH__)
@@ -656,6 +658,35 @@ def create_rcm_batch_launch(
             block_dim=block_dim,
             record_cmd=True,
         )
+    metal_traverse_launch = None
+    if complete_cuda_launch is None and is_metal(device):
+        # Metal: replay the CPU's traversal order in one launch (see rcm_batch_metal).
+        from .rcm_batch_metal import make_traverse_kernel  # noqa: PLC0415
+
+        metal_traverse_launch = wp.launch(
+            make_traverse_kernel(dtype),
+            dim=num_blocks,
+            inputs=[
+                num_blocks,
+                float(tol),
+                A_flat,
+                dims,
+                mio,
+                ld,
+                vio,
+                scratch["degree"],
+                scratch["level"],
+                scratch["order_buf"],
+                scratch["head"],
+                scratch["current_level"],
+                scratch["discovered"],
+                scratch["reorder_active"],
+                max_dim if complete_traversal else int(max_bfs_iters),
+            ],
+            device=device,
+            stream=stream,
+            record_cmd=True,
+        )
     append_unreached_launch = wp.launch(
         K["append_unreached"],
         dim=num_blocks,
@@ -706,6 +737,16 @@ def create_rcm_batch_launch(
                 traverse_level()
         append_unreached_launch.launch()
         reverse_launch.launch()
+
+    if metal_traverse_launch is not None:
+
+        def callback():
+            prepare_reorder_launch.launch()
+            init_and_degree_launch.launch()
+            select_and_seed_launch.launch()
+            metal_traverse_launch.launch()
+            append_unreached_launch.launch()
+            reverse_launch.launch()
 
     if use_cuda_graph:
         return create_cuda_graph_callback(callback, device=device, stream=stream)
