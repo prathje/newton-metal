@@ -33,7 +33,6 @@ from newton._src.solvers.kamino._src.solvers.dvi.kernels import (
     _solve_bilateral_unilateral_response_cooperative,
     _solve_dvi_inequalities_colored_pgs,
 )
-from newton._src.solvers.kamino._src.solvers.dvi.kernels_metal import _DENSE_PGS_ROWS_KERNELS
 from newton._src.solvers.kamino._src.solvers.dvi.projections import (
     contact_friction_normal_load as _contact_friction_normal_load,
 )
@@ -131,6 +130,18 @@ def _project_contact_tangent_for_test(
         wp.float32(1.0),
         lambda_max,
     )
+
+
+def _is_metal_dense_pgs_kernel(kernel) -> bool:
+    """Whether ``kernel`` is Metal's row-owned dense PGS variant (dvi/kernels_metal.py).
+
+    Imported lazily: the Metal-only module is not loaded on other devices.
+    """
+    if not any(getattr(d, "is_metal", False) for d in wp.get_devices()):
+        return False
+    from newton._src.solvers.kamino._src.solvers.dvi.kernels_metal import _DENSE_PGS_ROWS_KERNELS  # noqa: PLC0415
+
+    return any(kernel is k for k in _DENSE_PGS_ROWS_KERNELS.values())
 
 
 def _build_five_box_stack() -> newton.ModelBuilder:
@@ -1256,10 +1267,8 @@ class TestDVISolver(NewtonTestCase):
                 def tracked_launch(*args, _kernel=inequality_kernel, _launch=original_launch, **kwargs):
                     nonlocal launch_count
                     kernel = kwargs.get("kernel", args[0] if args else None)
-                    # Metal runs the dense sweep with its row-owned variant (dvi/kernels_metal.py).
                     if kernel is _kernel or (
-                        _kernel is _solve_dvi_inequalities_colored_pgs
-                        and any(kernel is k for k in _DENSE_PGS_ROWS_KERNELS.values())
+                        _kernel is _solve_dvi_inequalities_colored_pgs and _is_metal_dense_pgs_kernel(kernel)
                     ):
                         launch_count += 1
                     return _launch(*args, **kwargs)
