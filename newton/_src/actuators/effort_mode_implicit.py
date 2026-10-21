@@ -31,6 +31,7 @@ import numpy as np
 import warp as wp
 
 from ..sim import JointType
+from ..utils.device import is_metal
 from .drives.base import DriveBase
 from .joint_space_response import JointSpaceResponse
 
@@ -73,6 +74,24 @@ class ImplicitOptions:
 
     warm_start: WarmStart = WarmStart.EXPLICIT
     """Initial impulse guess."""
+
+
+def _use_metal_fp64_emulation() -> None:
+    """Give the coupled solve kernel real double precision on Metal.
+
+    The solve keeps its impulse, residual, slope, and Jacobian buffers in
+    ``float64`` (see :func:`_build_coupled_solve_kernel`). Apple GPUs have no
+    fp64 and Warp's Metal backend rejects ``float64`` arrays unless the module
+    opts into software fp64. ``"emulate"`` keeps IEEE binary64 arithmetic for
+    ``+ - * /``, comparisons, and conversions, which is all the built-in force
+    laws and clamps use. A custom force law that calls a transcendental
+    (``exp``, ``sin``, ...) on ``float64`` gets single precision for that call
+    on Metal. Called when an implicit mode is created on a Metal
+    device; CPU and CUDA processes never set the option, and Warp leaves
+    ``metal_*`` options out of the CPU/CUDA module hash.
+    """
+    if wp.get_module_options(__name__).get("metal_fp64") != "emulate":
+        wp.set_module_options({"metal_fp64": "emulate"}, __name__)
 
 
 # ---------------------------------------------------------------------------
@@ -381,6 +400,8 @@ class _EffortModeImplicit:
             raise ValueError(f"fd_epsilon must be positive, got {self._options.fd_epsilon}")
         self._num_actuators = num_actuators
         self._device = device
+        if is_metal(device):
+            _use_metal_fp64_emulation()
         if not isinstance(response, JointSpaceResponse):
             raise ValueError(
                 "Implicit actuation requires response to be a JointSpaceResponse; "
