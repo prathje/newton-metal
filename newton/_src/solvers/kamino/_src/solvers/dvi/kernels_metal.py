@@ -328,6 +328,16 @@ def _transpose_dense_world_blocks(
     dst[mio + n * j + i] = src[mio + n * i + j]
 
 
+@wp.func
+def _response_tile_skipped(
+    use_pattern: bool, tile_pattern: wp.array[int32], tile_offset: int32, tiles: int32, row: int32, col: int32
+) -> bool:
+    """Whether factor tile ``(row, col)`` is outside the filled RCM tile mask (exactly zero)."""
+    if not use_pattern:
+        return False
+    return tile_pattern[tile_offset + row * tiles + col] == int32(0)
+
+
 @wp.kernel
 def _solve_bilateral_unilateral_response_columns(
     problem_dim: wp.array[int32],
@@ -344,12 +354,21 @@ def _solve_bilateral_unilateral_response_columns(
     coupling: wp.array[float32],
     response_factor: wp.array[float32],
     response: wp.array[float32],
+    use_pattern: bool,
+    tile_pattern_offsets: wp.array[int32],
+    tile_pattern: wp.array[int32],
+    block_size: int32,
 ):
     """Metal variant of ``_solve_bilateral_unilateral_response``: one thread per response column.
 
     The CPU/non-CUDA kernel walks a world's columns with ``wp.block_dim()``
     lanes (one on CPU); columns are independent, so here each thread solves
-    one column with the same arithmetic in the same order.
+    one column with the same arithmetic in the same order, leaving out only
+    terms that are exactly zero: factor tiles outside the RCM tile mask
+    (``use_pattern``; the factorization clears them) and, in the forward
+    solve, rows above the column's first nonzero coupling entry (their
+    solution is zero). Removing ``x - 0 * y`` terms keeps every value; at most
+    the sign of a zero result can differ.
     """
     wid, unilateral = wp.tid()
     njc = problem_njc[wid]
@@ -361,20 +380,60 @@ def _solve_bilateral_unilateral_response_columns(
     bvio = bilateral_vio[wid]
     offset = response_mio[wid]
     unilateral_stride = response_stride[wid]
+    bs = wp.max(block_size, int32(1))
+    tiles = (njc + bs - int32(1)) / bs
+    tile_offset = int32(0)
+    if use_pattern:
+        tile_offset = tile_pattern_offsets[wid]
+
+    first_row = njc
     for row in range(njc):
         original_row = row
         if use_permutation:
             original_row = bilateral_permutation[bvio + row]
+        if first_row == njc and coupling[offset + original_row * unilateral_stride + unilateral] != float32(0.0):
+            first_row = row
+    if first_row == njc:
+        for row in range(njc):
+            original_row = row
+            if use_permutation:
+                original_row = bilateral_permutation[bvio + row]
+            response_factor[offset + row * unilateral_stride + unilateral] = float32(0.0)
+            response[offset + original_row * unilateral_stride + unilateral] = float32(0.0)
+        return
+
+    for row in range(first_row):
+        response_factor[offset + row * unilateral_stride + unilateral] = float32(0.0)
+    for row in range(first_row, njc):
+        original_row = row
+        if use_permutation:
+            original_row = bilateral_permutation[bvio + row]
         value = bilateral_P[bvio + original_row] * coupling[offset + original_row * unilateral_stride + unilateral]
-        for k in range(row):
-            value -= bilateral_L[factor + ld * row + k] * response_factor[offset + k * unilateral_stride + unilateral]
+        row_tile = row / bs
+        for col_tile in range(first_row / bs, row_tile + int32(1)):
+            if not _response_tile_skipped(use_pattern, tile_pattern, tile_offset, tiles, row_tile, col_tile):
+                k_begin = wp.max(first_row, col_tile * bs)
+                k_end = wp.min(row, (col_tile + int32(1)) * bs)
+                for k in range(k_begin, k_end):
+                    value -= (
+                        bilateral_L[factor + ld * row + k]
+                        * response_factor[offset + k * unilateral_stride + unilateral]
+                    )
         response_factor[offset + row * unilateral_stride + unilateral] = value / bilateral_L[factor + ld * row + row]
 
     for reverse_row in range(njc):
         row = njc - int32(1) - reverse_row
         value = response_factor[offset + row * unilateral_stride + unilateral]
-        for k in range(row + int32(1), njc):
-            value -= bilateral_L[factor + ld * k + row] * response_factor[offset + k * unilateral_stride + unilateral]
+        col_tile = row / bs
+        for row_tile in range(col_tile, tiles):
+            if not _response_tile_skipped(use_pattern, tile_pattern, tile_offset, tiles, row_tile, col_tile):
+                k_begin = wp.max(row + int32(1), row_tile * bs)
+                k_end = wp.min(njc, (row_tile + int32(1)) * bs)
+                for k in range(k_begin, k_end):
+                    value -= (
+                        bilateral_L[factor + ld * k + row]
+                        * response_factor[offset + k * unilateral_stride + unilateral]
+                    )
         response_factor[offset + row * unilateral_stride + unilateral] = value / bilateral_L[factor + ld * row + row]
 
     for row in range(njc):
