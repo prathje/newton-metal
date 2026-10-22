@@ -176,6 +176,7 @@ class TestMuJoCoDeterminismConfig(unittest.TestCase):
         solver._deterministic_max_records = 17
         solver.has_connect_constraints = False
         solver.has_jnt_connect_constraints = False
+        solver.model = types.SimpleNamespace(device=solver_mujoco.wp.get_device("cpu"))
         observed_options = []
 
         def observe_options():
@@ -194,6 +195,7 @@ class TestMuJoCoDeterminismConfig(unittest.TestCase):
             with (
                 mock.patch.object(solver, "_apply_module_options") as apply_module_options,
                 mock.patch.object(solver, "_prepare_generated_kernels") as prepare_generated_kernels,
+                mock.patch.object(solver, "_capture_while_bound", return_value=1),
                 mock.patch.object(solver, "_update_model_properties", side_effect=observe_options),
                 mock.patch.object(solver, "_invalidate_contact_fast_path"),
             ):
