@@ -12,6 +12,8 @@ import newton
 from newton._src.geometry.contact_reduction_hydroelastic import (
     FIXED_EXP_NONE,
     SPECULATIVE_BIN_OFFSET,
+    HydroelasticContactReduction,
+    HydroelasticReductionConfig,
     _fixed_mantissa_bits,
     _from_fixed,
     _to_fixed,
@@ -2637,6 +2639,34 @@ class TestHydroelastic(unittest.TestCase):
         metal_fixed, metal_roundtrip = results[metal[0].alias]
         np.testing.assert_array_equal(metal_fixed, cpu_fixed)
         np.testing.assert_array_equal(metal_roundtrip, cpu_roundtrip)
+
+    def test_deterministic_reducer_emulates_fp64_on_metal(self):
+        """A deterministic reducer on Metal opts its fixed-point kernels into software fp64.
+
+        Hydroelastic contacts do not reach the reducer on Metal yet, so this is the only
+        check that the reducer itself sets ``metal_fp64="emulate"`` and that its kernels
+        compile there (in the default ``"error"`` mode they reject float64 values).
+        """
+        metal = [d for d in get_test_devices() if getattr(d, "is_metal", False)]
+        if not metal:
+            self.skipTest("no Metal device")
+        reduction = HydroelasticContactReduction(
+            capacity=256,
+            device=metal[0],
+            config=HydroelasticReductionConfig(moment_matching=True),
+            deterministic=True,
+        )
+        kernels = (
+            reduction._accumulate_depth_kernel,
+            reduction._unreduced_aggregate_kernel,
+            reduction._finalize_kernel,
+            reduction._unreduced_moment_kernel,
+            reduction._accumulate_moments_kernel,
+        )
+        for kernel in kernels:
+            self.assertIsNotNone(kernel)
+            self.assertEqual(wp.get_module_options(kernel.module).get("metal_fp64"), "emulate", kernel.key)
+            wp.load_module(kernel.module, device=metal[0])
 
     def test_fixed_point_accumulator_cannot_overflow(self):
         """``_fixed_mantissa_bits`` keeps deterministic fixed-point sums inside int64.
