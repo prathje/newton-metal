@@ -24,7 +24,7 @@ from newton._src.solvers.kamino._src.solvers.lox.contact import (
     spatial_contact_delassus,
 )
 from newton._src.solvers.kamino._src.solvers.lox.system_kernels import normalize_symmetric_matrix
-from newton.tests.kamino import setup_tests, test_context
+from newton.tests.kamino import setup_tests, skip_lox_on_metal, test_context
 
 
 @wp.kernel
@@ -335,6 +335,8 @@ class TestLOXSpatialContact(unittest.TestCase):
         if not test_context.setup_done:
             setup_tests(clear_cache=False)
         self.default_device = wp.get_device(test_context.device)
+        # The spatial contact kernels do not compile on Metal (LOX is unsupported there).
+        skip_lox_on_metal(self, self.default_device)
 
     def _run(self, matrices, velocities, frictions, expected=None, *, status=0):
         device = self.default_device
