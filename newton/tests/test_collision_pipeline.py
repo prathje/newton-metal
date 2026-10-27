@@ -7815,5 +7815,39 @@ add_function_test(
 )
 
 
+def test_metal_full_surface_mesh_contacts_raise(test, device):
+    """Full-surface soft contacts against meshes fail loudly on Metal, before any contact is written."""
+    builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+    body = builder.add_body()
+    builder.add_shape_mesh(body, mesh=newton.Mesh.create_box(0.2, 0.2, 0.05))
+    builder.add_cloth_grid(
+        pos=wp.vec3(-0.24, -0.24, 0.055),
+        rot=wp.quat_identity(),
+        vel=wp.vec3(),
+        dim_x=4,
+        dim_y=4,
+        cell_x=0.12,
+        cell_y=0.12,
+        mass=0.1,
+        particle_radius=0.03,
+    )
+    model = builder.finalize(device=device)
+    with test.assertRaisesRegex(NotImplementedError, "not supported on Metal"):
+        newton.CollisionPipeline(model, enable_rigid_soft_full_surface_contact=True, soft_contact_max=1024)
+    # The default per-particle soft contact path is unaffected.
+    pipeline = newton.CollisionPipeline(model, soft_contact_max=1024)
+    contacts = pipeline.contacts()
+    pipeline.collide(model.state(), contacts)
+    test.assertGreater(int(contacts.soft_contact_count.numpy()[0]), 0)
+
+
+add_function_test(
+    TestCollisionPipeline,
+    "test_metal_full_surface_mesh_contacts_raise",
+    test_metal_full_surface_mesh_contacts_raise,
+    devices=_metal_devices,
+)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2, failfast=False)
