@@ -3,6 +3,7 @@
 
 """Contact torsion: per-shape spin friction, host and device preparation of SolverSteel."""
 
+import functools
 import inspect
 import itertools
 import unittest
@@ -477,6 +478,23 @@ def test_held_box_yaw_torque_threshold(test, device):
     test.assertGreater(anchors_only, 1.0)
 
 
+def _skip_on_metal(fn):
+    """Skip a Steel torsion test on Metal: SolverSteel is unsupported there.
+
+    These tests drive Steel's torsion kernels directly. They compute in float64,
+    which Warp's Metal backend rejects (no fp64 hardware), and Steel itself raises
+    NotImplementedError on Metal, so the kernels are unreachable there.
+    """
+
+    @functools.wraps(fn)
+    def wrapper(test, device, *args, **kwargs):
+        if getattr(wp.get_device(device), "is_metal", False):
+            test.skipTest("SolverSteel is not supported on Metal devices")
+        return fn(test, device, *args, **kwargs)
+
+    return wrapper
+
+
 class TestContactTorsionPatchGrouping(unittest.TestCase):
     """Follow persistent patch regions on the host without a solver step."""
 
@@ -497,7 +515,7 @@ for _fn in (
     test_region_with_inadmissible_member_is_skipped,
     test_broken_load_ring_is_rejected,
 ):
-    add_function_test(TestContactTorsionPatchGrouping, _fn.__name__, _fn, devices=get_test_devices())
+    add_function_test(TestContactTorsionPatchGrouping, _fn.__name__, _skip_on_metal(_fn), devices=get_test_devices())
 
 
 for _fn in (
@@ -1760,7 +1778,7 @@ for _fn in (
     test_deferred_failure_is_not_partial_success,
     test_deferred_preparation_has_no_host_array_transfers,
 ):
-    add_function_test(TestDeviceTorsionPreparation, _fn.__name__, _fn, devices=get_test_devices())
+    add_function_test(TestDeviceTorsionPreparation, _fn.__name__, _skip_on_metal(_fn), devices=get_test_devices())
 
 
 for _fn in (
