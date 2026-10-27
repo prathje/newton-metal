@@ -3720,10 +3720,16 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
             )
             values = moments.view(dtype=float)
             parameters = values[:, :YIELD_PARAM_LENGTH]
+            weights = values[:, YIELD_PARAM_LENGTH:]
+            if is_metal(values.device):
+                # Warp's Metal backend stages strided arguments through contiguous copies and
+                # rejects two written/read views of one buffer; the column blocks are disjoint,
+                # so read the weights from a contiguous copy instead.
+                weights = wp.clone(weights)
             wp.launch(
                 inverse_scale_vector,
                 dim=(scratch.strain_node_count, YIELD_PARAM_LENGTH),
-                inputs=[values[:, YIELD_PARAM_LENGTH:], parameters],
+                inputs=[weights, parameters],
             )
             scratch.strain_yield_parameters_field.dof_values = parameters.view(YieldParamVec)
 
