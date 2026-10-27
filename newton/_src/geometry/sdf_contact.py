@@ -15,6 +15,7 @@ from ..geometry.sdf_texture import (
     texture_sample_sdf_hw,
 )
 from ..geometry.types import GeoType
+from ..utils.device import is_metal
 from ..utils.heightfield import HeightfieldData, sample_sdf_grad_heightfield, sample_sdf_heightfield
 from .contact_reduction_global import (
     GlobalContactReducerData,
@@ -304,13 +305,22 @@ def compute_mesh_boundary_flags(mesh: wp.Mesh) -> np.ndarray:
     if len(candidates) > 0:
         slot = first_slot[candidates]
         candidate_edges = faces[(slot // 3)[:, None], opposite[slot % 3]]
-        boundary = wp.zeros(len(candidates), dtype=wp.int32, device=mesh.device)
+        query_mesh = mesh
+        if is_metal(mesh.device):
+            # The coverage sweep needs exact float64 collinearity tests, which Metal
+            # (no fp64 hardware) cannot run exactly; Warp's Metal backend would compute
+            # the vec3d math in float32. The flags are host data, so sweep a CPU copy.
+            query_mesh = wp.Mesh(
+                points=wp.array(mesh.points.numpy(), dtype=wp.vec3, device="cpu"),
+                indices=wp.array(mesh.indices.numpy(), dtype=wp.int32, device="cpu"),
+            )
+        boundary = wp.zeros(len(candidates), dtype=wp.int32, device=query_mesh.device)
         wp.launch(
             _mesh_edge_boundary_kernel,
             dim=len(candidates),
-            inputs=[mesh.id, wp.array(candidate_edges, dtype=wp.vec2i, device=mesh.device)],
+            inputs=[query_mesh.id, wp.array(candidate_edges, dtype=wp.vec2i, device=query_mesh.device)],
             outputs=[boundary],
-            device=mesh.device,
+            device=query_mesh.device,
         )
         open_edge[candidates] = boundary.numpy() != 0
     open_vertex = np.zeros(position_count, dtype=bool)
