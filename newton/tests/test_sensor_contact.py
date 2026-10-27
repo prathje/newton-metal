@@ -1005,6 +1005,8 @@ class TestSensorContactSteel(unittest.TestCase):
 
     def test_stacking_scenario(self):
         """Report each stacked box's weight through ``SensorContact.total_force``."""
+        if getattr(wp.get_device(), "is_metal", False):
+            self.skipTest("SolverSteel is not supported on Metal devices")
         builder = newton.ModelBuilder()
         builder.default_shape_cfg.density = 1000.0
         builder.add_shape_box(body=-1, hx=1.0, hy=1.0, hz=0.25, label="base")
