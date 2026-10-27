@@ -588,6 +588,16 @@ class TestKaminoMetalLanes(unittest.TestCase):
                         expected = np.linalg.cholesky(A64 + (shift if fails else 0.0) * np.eye(n))
                         np.testing.assert_allclose(factor, expected, rtol=0.0, atol=2.0e-3)
 
+    def test_lox_solver_rejected_on_metal(self):
+        # LOX's kernels cannot be compiled (or would race) on Metal: construction must fail loudly.
+        builder = newton.ModelBuilder()
+        SolverKamino.register_custom_attributes(builder)
+        body = builder.add_link(mass=1.0, inertia=np.eye(3).ravel().tolist())
+        builder.add_articulation([builder.add_joint_revolute(-1, body, axis=newton.Axis.Y)])
+        model = builder.finalize(device=self.metal)
+        with self.assertRaisesRegex(NotImplementedError, "LOX dynamics solver is not supported on Metal"):
+            SolverKamino(model, SolverKamino.Config(dynamics_solver="lox", use_collision_detector=False))
+
     def test_rcm_blocked_cholesky_matches_cpu_bitwise(self):
         # Metal traverses the RCM graph in the CPU's order, and its factorize/solve kernels
         # reproduce the CPU tile kernels' arithmetic order (fmaf tile dot products, scalar

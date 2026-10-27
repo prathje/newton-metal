@@ -33,7 +33,7 @@ from newton._src.solvers.kamino._src.solvers import PADMMSolver
 from newton._src.solvers.kamino._src.utils import logger as msg
 from newton._src.solvers.kamino.examples import print_progress_bar
 from newton._src.solvers.kamino.solver_kamino import SolverKamino
-from newton.tests.kamino import setup_tests, test_context
+from newton.tests.kamino import setup_tests, skip_lox_on_metal, test_context
 from newton.tests.kamino.utils.sampling import sample_world_mask
 from newton.tests.utils import basics
 from newton.tests.utils.basics import build_boxes_fourbar
@@ -866,6 +866,7 @@ class TestSolverKaminoStatus(unittest.TestCase):
 
     def test_lox_status_is_always_available(self):
         """Verify LOX terminal status is available with or without solution metrics."""
+        skip_lox_on_metal(self, self.default_device)
         model = self._make_three_world_model()
 
         for compute_solution_metrics in (False, True):

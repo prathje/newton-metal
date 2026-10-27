@@ -17,7 +17,7 @@ from newton._src.solvers.kamino._src.solver_kamino_impl import SolverKaminoImpl
 from newton._src.solvers.kamino.solver_kamino import SolverKamino
 from newton.solvers import SolverMuJoCo
 from newton.solvers.experimental.coupled import SolverCoupledProxy
-from newton.tests.kamino import setup_tests, test_context
+from newton.tests.kamino import setup_tests, skip_lox_on_metal, test_context
 from newton.tests.utils.basics import (
     build_box_on_plane,
     build_boxes_fourbar,
@@ -435,6 +435,7 @@ class _LOXTestCase(unittest.TestCase):
         if not test_context.setup_done:
             setup_tests(clear_cache=False)
         self.default_device = wp.get_device(test_context.device)
+        skip_lox_on_metal(self, self.default_device)
 
     def make_config(self, compute_solution_metrics: bool = False) -> SolverKamino.Config:
         return SolverKamino.Config(

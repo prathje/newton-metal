@@ -15,7 +15,7 @@ import warp as wp
 import newton
 from newton._src.solvers.kamino._src.core.materials import DEFAULT_FRICTION, DEFAULT_RESTITUTION
 from newton._src.solvers.kamino.solver_kamino import SolverKamino
-from newton.tests.kamino import setup_tests, test_context
+from newton.tests.kamino import setup_tests, skip_lox_on_metal, test_context
 
 
 def _build_revolute(
@@ -244,6 +244,7 @@ class TestKaminoNotifyModelChanged(unittest.TestCase):
 
     def test_lox_negative_joint_effort_limit_raises(self):
         """Reject negative effort limits when LOX validates model updates."""
+        skip_lox_on_metal(self, self.device)
         model = _build_revolute(
             dynamic=True,
             effort_limit=5.0,

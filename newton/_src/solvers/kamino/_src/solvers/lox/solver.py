@@ -11,6 +11,7 @@ import numpy as np
 import warp as wp
 
 from ......sim import BodyFlags, JointType, Model, ModelFlags
+from ......utils.device import is_metal
 from ....config import LOXSolverConfig
 from ...core.joints import JointCorrectionMode
 from ...core.state import StateKamino
@@ -105,6 +106,12 @@ def _world_thread_count(device: wp.DeviceLike, num_worlds: int, max_world_items:
 ###
 # Interfaces
 ###
+
+
+LOX_METAL_UNSUPPORTED_MESSAGE = (
+    "The Kamino LOX dynamics solver is not supported on Metal devices yet; use "
+    "dynamics_solver='padmm' or 'dvi', or a CPU or CUDA device."
+)
 
 
 class LOXSolver:
@@ -237,6 +244,11 @@ class LOXSolver:
                     + "\nWeld these bodies with fixed joints, give these joint DOFs armature,"
                     " or give the bodies a non-zero mass and inertia."
                 )
+        if is_metal(model.device):
+            # LOX's kernels use CUDA-only native snippets (warp shuffles, atomicMax on float bits),
+            # float64 arrays and tile functions that Warp's Metal backend cannot compile; the
+            # host fallbacks of some snippets assume serial CPU execution and would race on Metal.
+            raise NotImplementedError(LOX_METAL_UNSUPPORTED_MESSAGE)
         self._config = config
         self._constraints = constraints
         self._model = model

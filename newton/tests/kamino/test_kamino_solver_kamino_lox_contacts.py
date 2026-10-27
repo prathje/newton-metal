@@ -10,7 +10,7 @@ import warp as wp
 
 import newton
 from newton.solvers import SolverKamino
-from newton.tests.kamino import setup_tests, test_context
+from newton.tests.kamino import setup_tests, skip_lox_on_metal, test_context
 
 _CPU_QR_SKIP_REASON = (
     "warp.fem.linalg.symmetric_eigenvalues_qr can return NaN eigenvalues on the CPU for denormal "
@@ -32,6 +32,7 @@ class TestSolverKaminoLOXContacts(unittest.TestCase):
         if not test_context.setup_done:
             setup_tests(clear_cache=False)
         self.default_device = wp.get_device(test_context.device)
+        skip_lox_on_metal(self, self.default_device)
 
     def _sphere(
         self,
