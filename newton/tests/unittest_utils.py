@@ -5,6 +5,7 @@ import contextlib
 import ctypes
 import ctypes.util
 import dataclasses
+import functools
 import importlib.util
 import io
 import linecache
@@ -684,11 +685,13 @@ def _run_skipping_unsupported_on_metal(self, device, call):
 
     steel_init = solver_steel.SolverSteel.__init__
 
+    # wraps: inspect.signature(SolverSteel) must still show the real parameters.
+    @functools.wraps(steel_init)
     def init_or_skip(solver, *args, **kwargs):
         try:
             steel_init(solver, *args, **kwargs)
         except NotImplementedError as e:
-            if str(e) != solver_steel.STEEL_METAL_UNSUPPORTED_MESSAGE:
+            if str(e) != solver_steel.METAL_UNSUPPORTED_MESSAGE:
                 raise
             raise unittest.SkipTest(str(e)) from e
 

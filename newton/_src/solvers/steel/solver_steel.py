@@ -1208,7 +1208,7 @@ class _FrictionGapOption(_StepOption):
         super().__set__(instance, value)
 
 
-STEEL_METAL_UNSUPPORTED_MESSAGE = "SolverSteel is not supported on Metal devices; use a CPU or CUDA device."
+METAL_UNSUPPORTED_MESSAGE = "SolverSteel is not supported on Metal devices; use a CPU or CUDA device."
 
 
 class SolverSteel(SolverBase):
@@ -2101,7 +2101,7 @@ class SolverSteel(SolverBase):
         # namespace (no Warp device) to check argument validation.
         if getattr(model.device, "is_metal", False):
             # Steel has not been ported to or validated on Warp's Metal backend.
-            raise NotImplementedError(STEEL_METAL_UNSUPPORTED_MESSAGE)
+            raise NotImplementedError(METAL_UNSUPPORTED_MESSAGE)
         self._kernel_overrides = current_kernel_overrides()
         if contact_compliance:
             # Reject unsupported combinations before any allocation.
