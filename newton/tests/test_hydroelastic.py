@@ -2582,6 +2582,62 @@ class TestHydroelastic(unittest.TestCase):
         """Handle sentinel and high finite pressure contributions without overflow."""
         test_fixed_point_extreme_exponents(self, wp.get_device("cpu"))
 
+    def test_fixed_point_metal_matches_cpu(self):
+        """The deterministic fixed-point grid is bit-identical on Metal and CPU.
+
+        The scale ``2**(bits - exponent)`` exceeds the float32 range for small
+        exponents (|x| below ~1e-22), so on Metal the kernels must run in
+        software fp64 (``metal_fp64="emulate"``, set by the reducer); float32
+        would overflow the scale silently.
+        """
+        metal = [d for d in get_test_devices() if getattr(d, "is_metal", False)]
+        if not metal:
+            self.skipTest("no Metal device")
+
+        @wp.kernel(enable_backward=False, module="unique")
+        def roundtrip(
+            values: wp.array[wp.float32],
+            exponents: wp.array[wp.int32],
+            mantissa_bits: int,
+            fixed_values: wp.array[wp.int64],
+            roundtrip_values: wp.array[wp.float32],
+        ):
+            tid = wp.tid()
+            fixed_values[tid] = _to_fixed(values[tid], exponents[tid], mantissa_bits)
+            roundtrip_values[tid] = _from_fixed(fixed_values[tid], exponents[tid], mantissa_bits)
+
+        wp.set_module_options({"metal_fp64": "emulate"}, roundtrip.module)
+        mantissa_bits = _fixed_mantissa_bits(1024)
+        exponents_np = np.array([int(FIXED_EXP_NONE), 127, -1, -60, -72, -80, -99, -100, 10, -3], dtype=np.int32)
+        rng = np.random.default_rng(3)
+        values_np = (rng.uniform(1.0, 2.0, len(exponents_np)) * np.exp2(exponents_np.astype(np.float64))).astype(
+            np.float32
+        )
+        values_np[0] = 0.0
+        values_np[1] = np.finfo(np.float32).max
+        values_np[-1] *= -1.0
+        results = {}
+        for device in (wp.get_device("cpu"), metal[0]):
+            fixed_values = wp.empty(len(values_np), dtype=wp.int64, device=device)
+            roundtrip_values = wp.empty(len(values_np), dtype=wp.float32, device=device)
+            wp.launch(
+                roundtrip,
+                dim=len(values_np),
+                inputs=[
+                    wp.array(values_np, dtype=wp.float32, device=device),
+                    wp.array(exponents_np, dtype=wp.int32, device=device),
+                    mantissa_bits,
+                    fixed_values,
+                    roundtrip_values,
+                ],
+                device=device,
+            )
+            results[device.alias] = (fixed_values.numpy(), roundtrip_values.numpy())
+        cpu_fixed, cpu_roundtrip = results["cpu"]
+        metal_fixed, metal_roundtrip = results[metal[0].alias]
+        np.testing.assert_array_equal(metal_fixed, cpu_fixed)
+        np.testing.assert_array_equal(metal_roundtrip, cpu_roundtrip)
+
     def test_fixed_point_accumulator_cannot_overflow(self):
         """``_fixed_mantissa_bits`` keeps deterministic fixed-point sums inside int64.
 

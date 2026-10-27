@@ -31,6 +31,7 @@ from typing import Any
 import warp as wp
 
 from newton._src.geometry.hashtable import hashtable_find_or_insert
+from newton._src.utils.device import is_metal
 
 from .contact_data import ContactData
 from .contact_reduction import (
@@ -1626,6 +1627,23 @@ class HydroelasticContactReduction:
                 deterministic=deterministic,
                 mantissa_bits=self._mantissa_bits,
             )
+
+        if deterministic and is_metal(device):
+            # The fixed-point grid is built in float64 (shift = 2**(bits - exponent),
+            # up to ~2**160, past the float32 range). Apple GPUs have no fp64 and
+            # Warp's Metal backend rejects float64 values unless the kernel's module
+            # opts into software fp64; "emulate" computes these products, the
+            # rounding, the int64 conversions and pow(2.0, n) exactly. CPU and CUDA
+            # never set the option, and Warp leaves metal_* options out of their hash.
+            for kernel in (
+                self._accumulate_depth_kernel,
+                self._unreduced_aggregate_kernel,
+                self._finalize_kernel,
+                self._unreduced_moment_kernel,
+                self._accumulate_moments_kernel,
+            ):
+                if kernel is not None and wp.get_module_options(kernel.module).get("metal_fp64") != "emulate":
+                    wp.set_module_options({"metal_fp64": "emulate"}, kernel.module)
 
         # Create the export kernel with the configured options
         self._export_kernel = create_export_hydroelastic_reduced_contacts_kernel(
