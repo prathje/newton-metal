@@ -21,7 +21,6 @@ from ...exceptions import NewtonWarning
 from ...geometry.flags import ShapeFlags
 from ...sim import BodyFlags, Contacts, Control, JointType, Model, ModelBuilder, ModelFlags, State, StateFlags
 from ...sim.articulation import eval_fk
-from ...utils.device import is_metal
 from ..solver import SolverBase
 from . import contact_compliance as _contact_compliance
 from ._testing import current_kernel_overrides
@@ -2098,7 +2097,9 @@ class SolverSteel(SolverBase):
                 Steel's kernel modules always opt out of Warp's ``deterministic`` module option, so a
                 process-wide ``wp.config.deterministic`` only selects this mode.
         """
-        if is_metal(model.device):
+        # Read the attribute directly: tests construct Steel with a stand-in device
+        # namespace (no Warp device) to check argument validation.
+        if getattr(model.device, "is_metal", False):
             # Steel has not been ported to or validated on Warp's Metal backend.
             raise NotImplementedError(STEEL_METAL_UNSUPPORTED_MESSAGE)
         self._kernel_overrides = current_kernel_overrides()
