@@ -21,6 +21,7 @@ from ...exceptions import NewtonWarning
 from ...geometry.flags import ShapeFlags
 from ...sim import BodyFlags, Contacts, Control, JointType, Model, ModelBuilder, ModelFlags, State, StateFlags
 from ...sim.articulation import eval_fk
+from ...utils.device import is_metal
 from ..solver import SolverBase
 from . import contact_compliance as _contact_compliance
 from ._testing import current_kernel_overrides
@@ -1208,6 +1209,9 @@ class _FrictionGapOption(_StepOption):
         super().__set__(instance, value)
 
 
+STEEL_METAL_UNSUPPORTED_MESSAGE = "SolverSteel is not supported on Metal devices; use a CPU or CUDA device."
+
+
 class SolverSteel(SolverBase):
     """Reduced-coordinate articulated dynamics with a projected Gauss-Seidel constraint solve.
 
@@ -2094,6 +2098,9 @@ class SolverSteel(SolverBase):
                 Steel's kernel modules always opt out of Warp's ``deterministic`` module option, so a
                 process-wide ``wp.config.deterministic`` only selects this mode.
         """
+        if is_metal(model.device):
+            # Steel has not been ported to or validated on Warp's Metal backend.
+            raise NotImplementedError(STEEL_METAL_UNSUPPORTED_MESSAGE)
         self._kernel_overrides = current_kernel_overrides()
         if contact_compliance:
             # Reject unsupported combinations before any allocation.

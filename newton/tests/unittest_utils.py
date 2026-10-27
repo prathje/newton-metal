@@ -19,6 +19,7 @@ import unittest
 import warnings
 import xml.etree.ElementTree as ET
 from typing import Any
+from unittest import mock
 
 import numpy as np
 import warp as wp
@@ -665,14 +666,44 @@ def find_nonfinite_members(obj: Any | None) -> list[str]:
 
 # For legacy TestCase classes, check_output=True wraps the function in CheckOutput.
 # NewtonTestCase subclasses use their own stdout/stderr output contract instead.
+def _run_skipping_unsupported_on_metal(self, device, call):
+    """Run ``call``; on a Metal device, skip where it constructs a solver unsupported there.
+
+    The solver raises :class:`NotImplementedError` on Metal. While a Metal test runs, that
+    error is turned into :class:`unittest.SkipTest` at the constructor, so a ``subTest``
+    that builds the solver is skipped instead of failing, and the other subtests still run.
+    """
+    try:
+        on_metal = device is not None and getattr(wp.get_device(device), "is_metal", False)
+    except Exception:
+        on_metal = False
+    if not on_metal:
+        call()
+        return
+    from newton._src.solvers.steel import solver_steel  # noqa: PLC0415
+
+    steel_init = solver_steel.SolverSteel.__init__
+
+    def init_or_skip(solver, *args, **kwargs):
+        try:
+            steel_init(solver, *args, **kwargs)
+        except NotImplementedError as e:
+            if str(e) != solver_steel.STEEL_METAL_UNSUPPORTED_MESSAGE:
+                raise
+            raise unittest.SkipTest(str(e)) from e
+
+    with mock.patch.object(solver_steel.SolverSteel, "__init__", init_or_skip):
+        call()
+
+
 def create_test_func(func, device, check_output, **kwargs):
     # pass args to func
     def test_func(self):
         if check_output and not isinstance(self, NewtonTestCase):
             with CheckOutput(self):
-                func(self, device, **kwargs)
+                _run_skipping_unsupported_on_metal(self, device, lambda: func(self, device, **kwargs))
         else:
-            func(self, device, **kwargs)
+            _run_skipping_unsupported_on_metal(self, device, lambda: func(self, device, **kwargs))
 
     # Copy the __unittest_expecting_failure__ attribute from func to test_func
     if hasattr(func, "__unittest_expecting_failure__"):
