@@ -98,8 +98,13 @@ def _use_metal_fp64_emulation() -> None:
     device; CPU and CUDA processes never set the option, and Warp leaves
     ``metal_*`` options out of the CPU/CUDA module hash.
     """
-    if wp.get_module_options(__name__).get("metal_fp64") != "emulate":
-        wp.set_module_options({"metal_fp64": "emulate"}, __name__)
+    _emulate_fp64_on_metal(__name__)
+
+
+def _emulate_fp64_on_metal(module) -> None:
+    """Set ``metal_fp64="emulate"`` on ``module`` (a module name or a kernel's Warp module)."""
+    if wp.get_module_options(module).get("metal_fp64") != "emulate":
+        wp.set_module_options({"metal_fp64": "emulate"}, module)
 
 
 # ---------------------------------------------------------------------------
@@ -833,6 +838,10 @@ class _EffortModeImplicit:
         chain, entries = self._pack_clamps(clamping)
         key = (drive.evaluate_force, entries)
         self._kernel = _build_coupled_solve_kernel(drive.evaluate_force, chain, key)
+        if is_metal(self._device):
+            # The solve kernel lives in its own ("unique") Warp module, which the
+            # module-level option of _use_metal_fp64_emulation() does not reach.
+            _emulate_fp64_on_metal(self._kernel.module)
         self._kernel_key = key
         self._clamp_chain = chain
 
