@@ -451,6 +451,7 @@ def _failed_pivot_factor(device, solver_cls, blocks, shift, captured, **kwargs):
     P = solver.P.numpy() if hasattr(solver, "P") else None
     return solver.L.numpy(), matrix.numpy(), info.mio.numpy(), P
 
+
 class TestKaminoMetalLanes(unittest.TestCase):
     def setUp(self):
         if not test_context.setup_done:
@@ -504,14 +505,16 @@ class TestKaminoMetalLanes(unittest.TestCase):
                 finally:
                     wp.config.metal_coop_tiles = saved
                 self.assertGreater(n_m, 0)
-                width = width or solver._dense_pgs_threads_per_world()
-                self.assertGreater(width, 32)
+                launch_width = width or solver._dense_pgs_threads_per_world()
+                self.assertGreater(launch_width, 32)
                 if name.startswith("kapla"):
-                    self.assertGreater(int(ncts.max()), 4 * width)
+                    self.assertGreater(int(ncts.max()), 4 * launch_width)
                 # Wide-block model (one real threadgroup per world), or the serial model when
                 # coop tiles are off.
-                expected_block = width if coop_tiles else 0
-                self.assertEqual(getattr(dense_pgs_rows_kernel(width).adj, "_metal_coop_block_n", 0), expected_block)
+                expected_block = launch_width if coop_tiles else 0
+                self.assertEqual(
+                    getattr(dense_pgs_rows_kernel(launch_width).adj, "_metal_coop_block_n", 0), expected_block
+                )
                 self.assertEqual(n_ref, n_m)
                 self.assertGreater(np.abs(lam_ref).max(), 0.0)
                 np.testing.assert_array_equal(lam_m, lam_ref)
@@ -524,7 +527,7 @@ class TestKaminoMetalLanes(unittest.TestCase):
                 np.testing.assert_array_equal(problem_c.data.dim.numpy(), ncts)
                 lam_c, _v_c, _ = _dvi_pgs_solve(problem_c, solver_c)
                 vio = problem.data.vio.numpy()
-                for w, (o, n) in enumerate(zip(vio, ncts)):
+                for w, (o, n) in enumerate(zip(vio, ncts, strict=True)):
                     np.testing.assert_allclose(
                         lam_m[o : o + n].sum(), lam_c[o : o + n].sum(), rtol=2e-3, err_msg=f"world {w}"
                     )

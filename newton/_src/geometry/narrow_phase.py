@@ -3953,9 +3953,7 @@ class NarrowPhase:
                 max_split_query,
                 self.gjk_candidate_pairs_count,
                 self.gjk_candidate_pairs.shape[0],
-                self.split_gjk_work_count
-                if self.split_gjk_work_count is not None
-                else self.gjk_candidate_pairs_count,
+                self.split_gjk_work_count if self.split_gjk_work_count is not None else self.gjk_candidate_pairs_count,
                 self.split_gjk_work_items.shape[0] if self.split_gjk_work_items is not None else -1,
                 self.split_manifold_work_count
                 if self.split_manifold_work_count is not None
