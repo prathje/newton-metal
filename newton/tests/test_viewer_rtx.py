@@ -436,7 +436,7 @@ class TestViewerRTXMatricesMetalMatchesCpu(unittest.TestCase):
         quats /= np.linalg.norm(quats, axis=1, keepdims=True)
         xforms = np.concatenate([rng.normal(size=(n, 3)), quats], axis=1).astype(np.float32)
         with wp.ScopedDevice(device):
-            out = wp.zeros(n + 1, dtype=wp.mat44d)
+            out = wp.zeros(n, dtype=wp.mat44d)
             layer = wp.transform(wp.vec3(0.3, -1.0, 2.0), wp.quat(*quats[0].astype(np.float32)))
             wp.launch(
                 write_prim_world_matrices,
@@ -449,7 +449,6 @@ class TestViewerRTXMatricesMetalMatchesCpu(unittest.TestCase):
                     wp.array(rng.integers(-1, 4, size=n), dtype=int),
                     wp.array(rng.normal(size=(3, 3)).astype(np.float32), dtype=wp.vec3),
                     layer,
-                    1,
                 ],
                 outputs=[out],
             )
@@ -458,7 +457,6 @@ class TestViewerRTXMatricesMetalMatchesCpu(unittest.TestCase):
     def test_prim_world_matrices_match_cpu(self):
         ref = self._run("cpu")
         got = self._run(_metal_device())
-        np.testing.assert_array_equal(got[0], ref[0])  # row before the offset stays untouched
         np.testing.assert_allclose(got, ref, rtol=1e-6, atol=1e-6)
 
 
