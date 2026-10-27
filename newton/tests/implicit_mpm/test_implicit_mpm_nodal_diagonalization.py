@@ -256,7 +256,12 @@ def test_nodal_material_averaging(test, device):
                     kernel_options={"max_unroll": 4, "enable_backward": False},
                 )
                 values = moments.view(dtype=float)
-                wp.launch(inverse_scale_vector, dim=(n, 6), inputs=[values[:, 6:], values[:, :6]], device=device)
+                weights = values[:, 6:]
+                if device.is_metal:
+                    # Same as SolverImplicitMPM on Metal: strided arguments are staged through
+                    # contiguous copies, so two views of one buffer (one written) are rejected.
+                    weights = wp.clone(weights)
+                wp.launch(inverse_scale_vector, dim=(n, 6), inputs=[weights, values[:, :6]], device=device)
                 parameters = values[:, :6].view(YieldParamVec)
                 psi = np.ones((n, 5))
                 psi[0] = coords[:, 0] - 0.5
