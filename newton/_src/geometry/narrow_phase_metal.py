@@ -31,6 +31,7 @@ import weakref
 import numpy as np
 import warp as wp
 
+from ..exceptions import NewtonWarning
 from ..utils.device import is_capturing
 
 # Overflow kinds, in the order of ``verify_narrow_phase_buffers``'s checks.
@@ -187,7 +188,7 @@ def _report(flags: wp.array, warned: set[str], warn_load_percent: int) -> None:
             template.format(count=count, capacity=capacity, percent=warn_load_percent)
             + " (reported on a Metal device, where the collision pipeline cannot print; "
             "contacts past the buffer capacity were dropped.)",
-            RuntimeWarning,
+            NewtonWarning,
             stacklevel=3,
         )
 
