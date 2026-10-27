@@ -417,6 +417,40 @@ def _sparse_kapla_rollout(device, steps=12):
     return np.array(impulse), np.array(qd)
 
 
+def _failed_pivot_blocks(shift):
+    """Healthy and slightly indefinite SPD-like blocks (a ragged tile and the DR Legs size)."""
+    rng = np.random.default_rng(97)
+    blocks, failing = [], []
+    for n in (40, 192):
+        basis = rng.normal(size=(n, n))
+        blocks.append((basis @ basis.T / n + np.eye(n)).astype(np.float32))
+        failing.append(False)
+        # One slightly negative eigenvalue mimics round-off on a singular block.
+        eigenvectors = np.linalg.qr(rng.normal(size=(n, n)))[0]
+        eigenvalues = np.linspace(1.0, 2.0, n)
+        eigenvalues[0] = -0.2 * shift
+        blocks.append((eigenvectors * eigenvalues @ eigenvectors.T).astype(np.float32))
+        failing.append(True)
+    return blocks, failing
+
+
+def _failed_pivot_factor(device, solver_cls, blocks, shift, captured, **kwargs):
+    """Factor ``blocks`` with ``failed_pivot_shift``; returns (factor, matrix after compute, mio)."""
+    info = DenseSquareMultiLinearInfo()
+    info.finalize(dimensions=[b.shape[0] for b in blocks], dtype=wp.float32, device=device)
+    source = np.concatenate([b.ravel() for b in blocks])
+    matrix = wp.array(source, dtype=wp.float32, device=device)
+    solver = solver_cls(
+        operator=DenseLinearOperatorData(info=info, mat=matrix), failed_pivot_shift=shift, device=device, **kwargs
+    )
+    solver.compute(matrix)
+    if captured:
+        with wp.ScopedCapture(device=device) as capture:
+            solver.compute(matrix)
+        wp.capture_launch(capture.graph)
+    P = solver.P.numpy() if hasattr(solver, "P") else None
+    return solver.L.numpy(), matrix.numpy(), info.mio.numpy(), P
+
 class TestKaminoMetalLanes(unittest.TestCase):
     def setUp(self):
         if not test_context.setup_done:
@@ -520,6 +554,36 @@ class TestKaminoMetalLanes(unittest.TestCase):
                 np.testing.assert_array_equal(a, b, err_msg=f"block_sparse={block_sparse} failed={failed}")
             for a, b in zip(results["metal_columns"], results["cpu"], strict=True):
                 np.testing.assert_allclose(a, b, rtol=1e-4, atol=1e-5)
+
+    def test_failed_pivot_retry_on_metal(self):
+        # failed_pivot_shift (#4839) refactorizes blocks with a non-finite pivot after a diagonal
+        # shift. LLTB runs the lane-parallel kernels on Metal and LLTBRCM the tile-free ones;
+        # both must take the retry (no NaN factors) and leave healthy blocks untouched.
+        shift = 1.0e-5
+        blocks, failing = _failed_pivot_blocks(shift)
+        source = np.concatenate([b.ravel() for b in blocks])
+        for solver_cls in (LLTBlockedSolver, LLTBlockedRCMSolver):
+            for captured in (False, True):
+                with self.subTest(solver=solver_cls.__name__, captured=captured):
+                    L, matrix, mio, P = _failed_pivot_factor(self.metal, solver_cls, blocks, shift, captured)
+                    L_cpu, _, _, _ = _failed_pivot_factor("cpu", solver_cls, blocks, shift, False)
+                    self.assertTrue(np.isfinite(L).all())
+                    if solver_cls is LLTBlockedSolver:
+                        # The shift is removed from the caller's matrix again.
+                        np.testing.assert_allclose(matrix, source, rtol=0.0, atol=1.0e-6)
+                    vio = 0
+                    for index, (A, fails) in enumerate(zip(blocks, failing, strict=True)):
+                        n = A.shape[0]
+                        entries = slice(mio[index], mio[index] + n * n)
+                        factor = np.tril(L[entries].reshape(n, n))
+                        np.testing.assert_allclose(factor, np.tril(L_cpu[entries].reshape(n, n)), rtol=0.0, atol=2.0e-3)
+                        A64 = A.astype(np.float64)
+                        if P is not None:
+                            order = P[vio : vio + n]
+                            A64 = A64[np.ix_(order, order)]
+                        vio += n
+                        expected = np.linalg.cholesky(A64 + (shift if fails else 0.0) * np.eye(n))
+                        np.testing.assert_allclose(factor, expected, rtol=0.0, atol=2.0e-3)
 
     def test_rcm_blocked_cholesky_matches_cpu_bitwise(self):
         # Metal traverses the RCM graph in the CPU's order, and its factorize/solve kernels

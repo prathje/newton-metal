@@ -717,16 +717,16 @@ class LLTBlockedSolver(DirectSolver[ScalarType, IndexType]):
                 A=A,
                 L=self._L,
             )
-            return
-        factorize.llt_blocked_factorize(
-            kernel=self._factorize_kernel,
-            num_blocks=self._operator.info.num_blocks,
-            block_dim=self._factorize_block_dim,
-            dim=self._operator.info.dim,
-            mio=self._operator.info.mio,
-            A=A,
-            L=self._L,
-        )
+        else:
+            factorize.llt_blocked_factorize(
+                kernel=self._factorize_kernel,
+                num_blocks=self._operator.info.num_blocks,
+                block_dim=self._factorize_block_dim,
+                dim=self._operator.info.dim,
+                mio=self._operator.info.mio,
+                A=A,
+                L=self._L,
+            )
         if self._failed_pivot_shift > 0.0:
             # Round-off can break near-singular blocks; refactorize only those,
             # since the per-block kernel exits immediately for zero dimensions.
@@ -745,15 +745,26 @@ class LLTBlockedSolver(DirectSolver[ScalarType, IndexType]):
                 inputs=[info.dim, info.mio, self._retry_dim, self._failed_pivot_shift, A],
                 device=self._device,
             )
-            factorize.llt_blocked_factorize(
-                kernel=self._factorize_kernel,
-                num_blocks=info.num_blocks,
-                block_dim=self._factorize_block_dim,
-                dim=self._retry_dim,
-                mio=info.mio,
-                A=A,
-                L=self._L,
-            )
+            if self._use_lanes():
+                # Metal: refactorize the flagged blocks with the lane-parallel kernel, which
+                # also leaves zero-dimension (unflagged) blocks untouched.
+                llt_lanes.llt_lanes_factorize(
+                    num_blocks=info.num_blocks,
+                    dim=self._retry_dim,
+                    mio=info.mio,
+                    A=A,
+                    L=self._L,
+                )
+            else:
+                factorize.llt_blocked_factorize(
+                    kernel=self._factorize_kernel,
+                    num_blocks=info.num_blocks,
+                    block_dim=self._factorize_block_dim,
+                    dim=self._retry_dim,
+                    mio=info.mio,
+                    A=A,
+                    L=self._L,
+                )
             # Unlike the permuted copy that LLTBRCM factorizes, A belongs to the caller.
             wp.launch(
                 factorize.shift_failed_llt_factors,
