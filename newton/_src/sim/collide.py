@@ -49,7 +49,7 @@ from ..sim.contacts import GENERATION_SENTINEL, Contacts
 from ..sim.model import Model
 from ..sim.shape_contact_pairs import _shape_contact_pair_count_for_mask, _shape_contact_pair_counts
 from ..sim.state import State
-from ..utils.device import supports_streams
+from ..utils.device import is_capturing, supports_streams
 
 if TYPE_CHECKING:
     from ..solvers.coupled.model_view import ModelView
@@ -2729,7 +2729,7 @@ class CollisionPipeline:
         # and recorded normally.
 
         # Eager calls copy the sticky rescale flag to the host and raise on a copy from an earlier call; never syncs.
-        check_unit_scale_sdf = self._shape_unit_scale_sdf.shape[0] > 0 and not wp.get_device(self.device).is_capturing
+        check_unit_scale_sdf = self._shape_unit_scale_sdf.shape[0] > 0 and not is_capturing(self.device)
         if check_unit_scale_sdf and self._unit_scale_sdf_rescaled_host.numpy()[0]:
             raise RuntimeError("Rescaled a unit-scale texture SDF shape; set dynamic_shape_scale=True (slower).")
 

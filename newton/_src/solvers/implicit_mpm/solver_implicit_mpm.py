@@ -244,7 +244,7 @@ def _make_pic_basis_space(pic: fem.PicQuadrature, basis_str: str):
     except ValueError:
         max_points_per_cell = -1
 
-    if max_points_per_cell < 0 and wp.get_device().is_capturing:
+    if max_points_per_cell < 0 and is_capturing(wp.get_device()):
         raise RuntimeError("Uncapped 'pic' requires a host read; use an explicit 'picN' limit for graph capture.")
 
     return fem.PointBasisSpace(pic, max_nodes_per_element=max_points_per_cell, use_evaluation_point_index=True)

@@ -28,6 +28,7 @@ from ..sim import (
 )
 from ..sim.articulation import _INCLUDE_ARMATURE_DEPRECATION_MSG, _eval_mass_matrix
 from ..solvers.solver import SolverBase
+from .device import is_capturing
 
 if TYPE_CHECKING:
     from ..actuators.actuator import Actuator
@@ -1647,7 +1648,7 @@ class ArticulationView:
         if entry is not None and entry[1] is source_array and entry[2] is source_grad:
             return entry[0]
         attrib = self._create_attribute_array(name, source, _slice, layout)
-        if not wp.get_device(self.device).is_capturing:
+        if not is_capturing(self.device):
             entries[key] = (attrib, source_array, source_grad)
         return attrib
 
@@ -2461,7 +2462,7 @@ class ArticulationView:
             mapping = None
         if mapping is None:
             mapping = self._create_actuator_dof_mapping(actuator)
-            if cache is not None and not wp.get_device(self.device).is_capturing:
+            if cache is not None and not is_capturing(self.device):
                 cache[actuator] = mapping
         return mapping
 

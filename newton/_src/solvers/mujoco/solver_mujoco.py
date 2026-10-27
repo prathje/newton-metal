@@ -5847,7 +5847,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
 
     def _validate_compiled_actuator_gears(self) -> None:
         """Reject gear edits that invalidate MuJoCo-Warp's folded passive damping."""
-        if not self._compiled_actuator_gear_indices.size or self.model.device.is_capturing:
+        if not self._compiled_actuator_gear_indices.size or is_capturing(self.model.device):
             return
 
         current = self.model.mujoco.actuator_gear.numpy()[self._compiled_actuator_gear_indices]
