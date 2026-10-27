@@ -257,7 +257,7 @@ def test_nodal_material_averaging(test, device):
                 )
                 values = moments.view(dtype=float)
                 weights = values[:, 6:]
-                if device.is_metal:
+                if getattr(device, "is_metal", False):
                     # Same as SolverImplicitMPM on Metal: strided arguments are staged through
                     # contiguous copies, so two views of one buffer (one written) are rejected.
                     weights = wp.clone(weights)
