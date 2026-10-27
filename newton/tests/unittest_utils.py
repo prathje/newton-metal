@@ -673,6 +673,7 @@ def _run_skipping_unsupported_on_metal(self, device, call):
     The solver raises :class:`NotImplementedError` on Metal. While a Metal test runs, that
     error is turned into :class:`unittest.SkipTest` at the constructor, so a ``subTest``
     that builds the solver is skipped instead of failing, and the other subtests still run.
+    Kamino's LOX dynamics solver (also unsupported on Metal) skips the whole test.
     """
     try:
         on_metal = device is not None and getattr(wp.get_device(device), "is_metal", False)
@@ -695,8 +696,16 @@ def _run_skipping_unsupported_on_metal(self, device, call):
                 raise
             raise unittest.SkipTest(str(e)) from e
 
+    from newton._src.solvers.kamino._src.solvers.lox.solver import LOX_METAL_UNSUPPORTED_MESSAGE  # noqa: PLC0415
+
     with mock.patch.object(solver_steel.SolverSteel, "__init__", init_or_skip):
-        call()
+        try:
+            call()
+        except NotImplementedError as e:
+            # Kamino's LOX dynamics solver raises this at construction on Metal.
+            if str(e) != LOX_METAL_UNSUPPORTED_MESSAGE:
+                raise
+            raise unittest.SkipTest(str(e)) from e
 
 
 def create_test_func(func, device, check_output, **kwargs):
