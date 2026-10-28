@@ -535,18 +535,6 @@ class LLTSequentialSolver(DirectSolver[ScalarType, IndexType]):
         self._y.zero_()
         self._has_factors = False
 
-    def _lanes_factorize(self, dim: wp.array[IndexType], A: wp.array[ScalarType]) -> None:
-        # Metal: one threadgroup per block (``llt_wide_metal``), or one SIMD group per block
-        # (``llt_lanes``) when NEWTON_KAMINO_METAL_WIDE_LLT=0.
-        if llt_wide_metal.llt_wide_enabled():
-            llt_wide_metal.llt_wide_factorize(
-                num_blocks=self._operator.info.num_blocks, dim=dim, mio=self._operator.info.mio, A=A, L=self._L
-            )
-        else:
-            llt_lanes.llt_lanes_factorize(
-                num_blocks=self._operator.info.num_blocks, dim=dim, mio=self._operator.info.mio, A=A, L=self._L
-            )
-
     @override
     def _factorize_impl(self, A: wp.array[ScalarType]) -> None:
         factorize.llt_sequential_factorize(

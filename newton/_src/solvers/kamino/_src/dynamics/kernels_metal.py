@@ -192,6 +192,8 @@ def build_delassus_tiled(
     pso = _TILED_PSO.get("p")
     if pso is None:
         pso = _TILED_PSO["p"] = disp.compile(_DELASSUS_TILED_MSL, "kamino_build_delassus_tiled")
+    if int(pso.maxTotalThreadsPerThreadgroup()) < 256:
+        raise RuntimeError("Kamino tiled Delassus build: the kernel needs 256 threads per threadgroup")
     nt = (int(max_dim) + 31) // 32
     max_tiles = nt * (nt + 1) // 2
     groups = max(1, min(max_tiles, total_groups // max(num_worlds, 1)))
