@@ -69,6 +69,7 @@ from typing import Any
 import numpy as np
 import warp as wp
 
+from .....utils.device import is_metal
 from ..core.data import DataKamino
 from ..core.model import ModelKamino
 from ..core.size import SizeKamino
@@ -1086,23 +1087,45 @@ class DelassusOperator:
             upper_tri_size = max_ncts * (max_ncts + 1) // 2
             warp_size = 32
             upper_tri_size = ((upper_tri_size + warp_size - 1) // warp_size) * warp_size
-            wp.launch(
-                kernel=_build_delassus_elementwise_dense,
-                dim=(self._size.num_worlds, upper_tri_size),
-                inputs=[
-                    # Inputs:
-                    model.info.bodies_offset,
-                    model.bodies.inv_m_i,
-                    data.bodies.inv_I_i,
-                    jacobians.data.J_cts_offsets,
-                    jacobians.data.J_cts_data,
-                    self._operator.info.dim,
-                    self._operator.info.mio,
-                    # Outputs:
-                    self._operator.mat,
-                ],
-                device=self._device,
-            )
+            if is_metal(self._device):
+                # Metal: loop over the active elements instead of one thread per capacity element.
+                from . import kernels_metal  # noqa: PLC0415
+
+                stride = kernels_metal.metal_stride(self._size.num_worlds, upper_tri_size)
+                wp.launch(
+                    kernel=kernels_metal.build_delassus_elementwise_dense_strided,
+                    dim=(self._size.num_worlds, stride),
+                    inputs=[
+                        model.info.bodies_offset,
+                        model.bodies.inv_m_i,
+                        data.bodies.inv_I_i,
+                        jacobians.data.J_cts_offsets,
+                        jacobians.data.J_cts_data,
+                        self._operator.info.dim,
+                        self._operator.info.mio,
+                        stride,
+                        self._operator.mat,
+                    ],
+                    device=self._device,
+                )
+            else:
+                wp.launch(
+                    kernel=_build_delassus_elementwise_dense,
+                    dim=(self._size.num_worlds, upper_tri_size),
+                    inputs=[
+                        # Inputs:
+                        model.info.bodies_offset,
+                        model.bodies.inv_m_i,
+                        data.bodies.inv_I_i,
+                        jacobians.data.J_cts_offsets,
+                        jacobians.data.J_cts_data,
+                        self._operator.info.dim,
+                        self._operator.info.mio,
+                        # Outputs:
+                        self._operator.mat,
+                    ],
+                    device=self._device,
+                )
         else:
             jacobian_cts = jacobians._J_cts.bsm
             upper_tri_size = jacobian_cts.max_of_num_nzb * (jacobian_cts.max_of_num_nzb + 1) // 2

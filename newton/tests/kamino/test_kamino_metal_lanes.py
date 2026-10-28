@@ -631,6 +631,24 @@ class TestKaminoMetalLanes(unittest.TestCase):
             self.assertTrue(np.isnan(lw[mio[-1] : mio[-1] + 25]).any())
             self.assertTrue(np.isnan(ll[mio[-1] : mio[-1] + 25]).any())
 
+    def test_strided_delassus_build_and_preconditioning_bitwise(self):
+        """Metal's active-element loops (dynamics/kernels_metal.py) reproduce the per-capacity-element
+        CUDA/CPU kernels bit for bit."""
+        test = TestSetup(builder_fn=_padmm_mixed_worlds_builder, max_world_contacts=64, device=self.metal)
+        test.build()
+        D_strided = test.problem.data.D.numpy().copy()
+        P_strided = test.problem.data.P.numpy().copy()
+        dims = test.problem.data.dim.numpy()
+        self.assertGreater(int(dims.max()), 32)
+        with (
+            mock.patch("newton._src.solvers.kamino._src.dynamics.delassus.is_metal", return_value=False),
+            mock.patch("newton._src.solvers.kamino._src.dynamics.dual.is_metal", return_value=False),
+        ):
+            test.build()
+        np.testing.assert_array_equal(test.problem.data.P.numpy(), P_strided)
+        np.testing.assert_array_equal(test.problem.data.D.numpy(), D_strided)
+        # (No CPU comparison: CPU emits the contacts in another order, so D's rows are permuted.)
+
     def test_fused_division_is_ieee(self):
         """The solve's reciprocal + Newton-correction division rounds like IEEE division."""
         rng = np.random.default_rng(4)

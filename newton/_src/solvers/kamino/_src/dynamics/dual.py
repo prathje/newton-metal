@@ -59,6 +59,7 @@ from typing import Any
 import warp as wp
 
 from .....core.types import override
+from .....utils.device import is_metal
 from ...config import ConfigBase, ConstrainedDynamicsConfig, ConstraintStabilizationConfig
 from ..core.data import DataKamino
 from ..core.math import FLOAT32_EPS, compute_gyroscopic_torque
@@ -1933,6 +1934,8 @@ class DualProblem:
         if self._sparse:
             # Preconditioner has already been connected to appropriate array
             pass
+        elif is_metal(self.device):
+            self._apply_dual_preconditioner_to_matrix_metal(self._data.D, self.delassus._max_of_max_total_D_size)
         else:
             wp.launch(
                 _apply_dual_preconditioner_to_matrix,
@@ -1960,6 +1963,19 @@ class DualProblem:
                 # Outputs:
                 self._data.v_f,
             ],
+            device=self.device,
+        )
+
+    def _apply_dual_preconditioner_to_matrix_metal(self, X: wp.array[wp.float32], capacity: int):
+        """Metal: ``_apply_dual_preconditioner_to_matrix`` looping over the active entries
+        (``kernels_metal``; bit-identical, without one thread per capacity entry)."""
+        from . import kernels_metal  # noqa: PLC0415
+
+        stride = kernels_metal.metal_stride(self._size.num_worlds, capacity)
+        wp.launch(
+            kernels_metal.apply_dual_preconditioner_to_matrix_strided,
+            dim=(self._size.num_worlds, stride),
+            inputs=[self._data.dim, self._data.mio, self._data.vio, self._data.P, stride, X],
             device=self.device,
         )
 
