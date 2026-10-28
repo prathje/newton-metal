@@ -65,6 +65,7 @@ def _tg_for(num_worlds: int, tg: int) -> int:
         return tg
     return 512 if num_worlds <= 32 else 256
 
+
 _LBS = 2112
 """Floats per staged block of L (must match ``LBS`` in the MSL source)."""
 
@@ -98,7 +99,11 @@ def _msl_struct(name: str, wp_struct) -> str:
         offset += 4
     if offset != dt.itemsize:
         raise TypeError(f"{name}: unexpected padding ({dt.itemsize} bytes)")
-    return f"struct {name} {{\n" + "\n".join(fields) + f"\n}};\nstatic_assert(sizeof({name}) == {dt.itemsize}, \"layout\");\n"
+    return (
+        f"struct {name} {{\n"
+        + "\n".join(fields)
+        + f'\n}};\nstatic_assert(sizeof({name}) == {dt.itemsize}, "layout");\n'
+    )
 
 
 # Argument table: device addresses of every array plus scalars (bound with setBytes).
@@ -918,10 +923,8 @@ def launch_fused_padmm_accel(solver, problem, tg: int = FUSED_TG_SIZE) -> None:
         "a_p": st.a_p,
         "a_factor": st.a_factor,
     }
-    writes = ("penalty", "status", "done", "atol", "x", "x_p", "y", "z", "y_hat", "z_hat", "y_p", "z_p", "v", "a")
-    modes = {k: "rw" for k in writes}
-    modes["a_p"] = "rw"
-    modes["a_factor"] = "rw"
+    writes = ("penalty", "status", "done", "atol", "x", "x_p", "y", "z", "y_hat", "z_hat", "y_p", "z_p", "v")
+    modes = dict.fromkeys((*writes, "a", "a_p", "a_factor"), "rw")
     _dispatch(
         "kamino_padmm_accel_dense",
         solver._size.num_worlds,

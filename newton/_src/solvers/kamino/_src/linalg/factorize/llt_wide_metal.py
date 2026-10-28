@@ -193,6 +193,7 @@ kernel void kamino_llt_factorize_wide(device const int* dims [[buffer(0)]],
 }
 """
 
+
 def _diag_code() -> str:
     """Straight-line MSL for the 32x32 diagonal-block Crout factorization (no arrays, so
     nothing can spill to stack memory). Lane r holds row r in x0..x31 and publishes each

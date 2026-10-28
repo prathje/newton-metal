@@ -514,19 +514,15 @@ class TestKaminoMetalLanes(unittest.TestCase):
         for name, builder_fn in (("fourbar_and_boxes", _padmm_builder), ("mixed_worlds", _padmm_mixed_worlds_builder)):
             for captured in (False, True):
                 with self.subTest(name, captured=captured):
-                    st_c, lam_c, *_ = _padmm_solve("cpu", builder_fn=builder_fn)
+                    _st_c, lam_c, *_ = _padmm_solve("cpu", builder_fn=builder_fn)
                     st_k, lam_k, *_ = _padmm_solve(self.metal, fused=False, builder_fn=builder_fn, captured=captured)
-                    launches = []
-                    orig = metal_fused.launch_fused_padmm_accel
                     with mock.patch.object(
-                        metal_fused,
-                        "launch_fused_padmm_accel",
-                        side_effect=lambda *a, **k: (launches.append(1), orig(*a, **k)),
-                    ):
+                        metal_fused, "launch_fused_padmm_accel", wraps=metal_fused.launch_fused_padmm_accel
+                    ) as launch:
                         st_f, lam_f, ncts, solver, _test = _padmm_solve(
                             self.metal, fused=True, builder_fn=builder_fn, captured=captured
                         )
-                    self.assertEqual(len(launches), 1, "the fused loop must replace the iteration loop")
+                    self.assertEqual(launch.call_count, 1, "the fused loop must replace the iteration loop")
                     self.assertGreater(ncts, 32, "the test needs several panels")
                     self.assertEqual(int(solver.data.state.done.numpy()[0]), 0)
                     nw = st_f.shape[0]
@@ -655,7 +651,9 @@ class TestKaminoMetalLanes(unittest.TestCase):
         n = 1 << 20
         for scale in (1.0, 1e-20, 1e20):
             a = (rng.standard_normal(n) * scale).astype(np.float32)
-            b = ((np.abs(rng.standard_normal(n)) + 1e-3) * rng.choice([1e-10, 1e-3, 1.0, 1e3, 1e10], n)).astype(np.float32)
+            b = ((np.abs(rng.standard_normal(n)) + 1e-3) * rng.choice([1e-10, 1e-3, 1.0, 1e3, 1e10], n)).astype(
+                np.float32
+            )
             dev = self.metal
             out = wp.zeros(n, dtype=wp.float32, device=dev)
             metal_fused.probe_div_rn(
