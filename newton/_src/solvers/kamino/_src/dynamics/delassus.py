@@ -1088,25 +1088,21 @@ class DelassusOperator:
             warp_size = 32
             upper_tri_size = ((upper_tri_size + warp_size - 1) // warp_size) * warp_size
             if is_metal(self._device):
-                # Metal: loop over the active elements instead of one thread per capacity element.
+                # Metal: 32x32 tiles over the active upper triangle with the Jacobian rows staged
+                # in threadgroup memory (bit-identical to the kernel below; see kernels_metal).
                 from . import kernels_metal  # noqa: PLC0415
 
-                stride = kernels_metal.metal_stride(self._size.num_worlds, upper_tri_size)
-                wp.launch(
-                    kernel=kernels_metal.build_delassus_elementwise_dense_strided,
-                    dim=(self._size.num_worlds, stride),
-                    inputs=[
-                        model.info.bodies_offset,
-                        model.bodies.inv_m_i,
-                        data.bodies.inv_I_i,
-                        jacobians.data.J_cts_offsets,
-                        jacobians.data.J_cts_data,
-                        self._operator.info.dim,
-                        self._operator.info.mio,
-                        stride,
-                        self._operator.mat,
-                    ],
-                    device=self._device,
+                kernels_metal.build_delassus_tiled(
+                    self._size.num_worlds,
+                    max_ncts,
+                    model.info.bodies_offset,
+                    model.bodies.inv_m_i,
+                    data.bodies.inv_I_i,
+                    jacobians.data.J_cts_offsets,
+                    jacobians.data.J_cts_data,
+                    self._operator.info.dim,
+                    self._operator.info.mio,
+                    self._operator.mat,
                 )
             else:
                 wp.launch(
