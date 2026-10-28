@@ -55,8 +55,15 @@ __all__ = [
     "probe_div_rn",
 ]
 
-FUSED_TG_SIZE = int(os.environ.get("NEWTON_KAMINO_METAL_PADMM_TG", "512"))
-"""Threads per world (threadgroup size) of the fused kernel."""
+FUSED_TG_SIZE = int(os.environ.get("NEWTON_KAMINO_METAL_PADMM_TG", "0"))
+"""Threads per world (threadgroup size) of the fused kernel; 0 picks 512 for up to 32 worlds
+(one world per GPU core, latency-bound) and 256 beyond (throughput-bound)."""
+
+
+def _tg_for(num_worlds: int, tg: int) -> int:
+    if tg > 0:
+        return tg
+    return 512 if num_worlds <= 32 else 256
 
 _LBS = 2112
 """Floats per staged block of L (must match ``LBS`` in the MSL source)."""
@@ -853,7 +860,8 @@ def fused_padmm_supported(solver, problem) -> bool:
     iters = {int(c.max_iterations) for c in solver._config}
     if len(iters) != 1 or min(iters) < 1:
         return False
-    return _tg_bytes(FUSED_TG_SIZE, _ncap(solver._size.max_of_max_total_cts)) <= _max_tg_memory()
+    tg = _tg_for(solver._size.num_worlds, FUSED_TG_SIZE)
+    return _tg_bytes(tg, _ncap(solver._size.max_of_max_total_cts)) <= _max_tg_memory()
 
 
 def _tg_bytes(tg: int, ncap: int) -> int:
@@ -869,6 +877,7 @@ def _max_tg_memory() -> int:
 
 def launch_fused_padmm_accel(solver, problem, tg: int = FUSED_TG_SIZE) -> None:
     """Run the accelerated PADMM iterations of every world in one dispatch."""
+    tg = _tg_for(solver._size.num_worlds, tg)
     d = problem.data
     sd = solver._data
     st = sd.state
@@ -936,6 +945,7 @@ def launch_wide_llt_solve(
     tg: int = FUSED_TG_SIZE,
 ) -> None:
     """Solve ``L L^T x = b`` per block with one threadgroup per block (``x`` may alias ``b``)."""
+    tg = _tg_for(num_blocks, tg)
     arrays = {"dim": dim, "mio": mio, "vio": vio, "L": L, "v": b, "x": x}
     modes = {"x": "rw"}
     _dispatch("kamino_llt_solve_wide", num_blocks, max_dim, arrays, modes, False, tg)
