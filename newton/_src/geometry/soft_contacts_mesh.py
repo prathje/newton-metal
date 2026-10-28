@@ -1390,6 +1390,9 @@ def launch_soft_mesh_contacts(*, model: Model, state: State, contacts: Contacts,
         device=device,
         record_tape=False,
     )
+    if getattr(data, "metal_overflow", None) is not None:
+        # _end_mesh_contacts cannot print on Metal; report the overflow from the host.
+        data.metal_overflow.launch(contact_count, contact_max)
     if contact_max == 0:
         return
     _launch_evaluate_mesh_contacts(model, state, contacts, data)
@@ -1662,6 +1665,9 @@ def _soft_contact_force_enabled(contact_index: int, data: _SoftContactFilterData
 class MeshContactData:
     """Fixed mesh topology and acceleration structures; no candidate-contact buffer."""
 
+    # Capacity overflow reporter on Metal devices, where kernels cannot print.
+    metal_overflow = None
+
     @property
     def edge_edge_parallel_epsilon(self) -> float:
         return self.detector.edge_edge_parallel_epsilon if self.detector is not None else 1.0e-5
@@ -1670,17 +1676,9 @@ class MeshContactData:
         self, model: Model, shape_mask: np.ndarray, vertex_pairs: wp.array[wp.vec2i], contact_headroom: int = 8
     ):
         if is_metal(model.device):
-            # The detection kernels use CUDA/C++ native snippets (BVH partitioning, warp-shuffled
-            # sign queries, Woop ray-triangle tests) and BVH sphere/capsule queries that Warp's
-            # Metal backend cannot compile. Fail here, before any contact is written, instead of
-            # mid-collide with a partially filled contact buffer.
-            raise NotImplementedError(
-                "Full-surface soft contacts against mesh shapes "
-                "(CollisionPipeline(enable_rigid_soft_full_surface_contact=True) with mesh shapes that "
-                "collide with particles) are not supported on Metal yet. Disable "
-                "enable_rigid_soft_full_surface_contact, clear ShapeFlags.COLLIDE_PARTICLES on the mesh "
-                "shapes, or use a CPU or CUDA device."
-            )
+            from .soft_contacts_mesh_metal import MeshContactOverflowMonitor  # noqa: PLC0415
+
+            self.metal_overflow = MeshContactOverflowMonitor(model.device)
         self.vertex_pairs = vertex_pairs
         meshes = _collision_meshes(model, shape_mask)
         if model.tri_count:
