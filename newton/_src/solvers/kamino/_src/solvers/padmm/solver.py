@@ -435,7 +435,16 @@ class PADMMSolver:
 
         # Iterate until convergence or maximum number of iterations is reached
         step_fn = self._step_accel if self._use_acceleration else self._step
-        if self._use_graph_conditionals:
+        fused = None
+        if is_metal(self.device):
+            from . import metal_fused  # noqa: PLC0415
+
+            if metal_fused.fused_padmm_supported(self, problem):
+                fused = metal_fused
+        if fused is not None:
+            # Metal: every world's iteration loop in one dispatch (same iterations, see metal_fused).
+            fused.launch_fused_padmm_accel(self, problem)
+        elif self._use_graph_conditionals:
             device = self._data.state.done.device
             check_conditional_capture(device, "PADMMSolver with use_graph_conditionals=True")
             with capture_while_budget(device, self._max_of_max_iters + 1):

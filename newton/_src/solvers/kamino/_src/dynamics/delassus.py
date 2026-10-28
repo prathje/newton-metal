@@ -69,6 +69,7 @@ from typing import Any
 import numpy as np
 import warp as wp
 
+from .....utils.device import is_metal
 from ..core.data import DataKamino
 from ..core.model import ModelKamino
 from ..core.size import SizeKamino
@@ -1030,6 +1031,22 @@ class DelassusOperator:
         Sets all values of the Delassus matrix to zero.
         This is useful for resetting the operator before recomputing it.
         """
+        if is_metal(self._device) and self._world_maxdims:
+            # Metal: only the part any build wrote (zeroing the whole capacity costs ~10 ms per
+            # call with 128 anymal_d worlds); the resulting buffer is the same.
+            from . import kernels_metal  # noqa: PLC0415
+
+            if getattr(self, "_metal_written_extent", None) is None:
+                self._metal_written_extent = wp.zeros(self._num_worlds, dtype=wp.int32, device=self._device)
+            kernels_metal.zero_written(
+                self._num_worlds,
+                max(self._world_maxdims),
+                self._operator.info.dim,
+                self._operator.info.mio,
+                self._metal_written_extent,
+                self._operator.mat,
+            )
+            return
         self._operator.mat.zero_()
 
     def build(
@@ -1086,11 +1103,14 @@ class DelassusOperator:
             upper_tri_size = max_ncts * (max_ncts + 1) // 2
             warp_size = 32
             upper_tri_size = ((upper_tri_size + warp_size - 1) // warp_size) * warp_size
-            wp.launch(
-                kernel=_build_delassus_elementwise_dense,
-                dim=(self._size.num_worlds, upper_tri_size),
-                inputs=[
-                    # Inputs:
+            if is_metal(self._device):
+                # Metal: 32x32 tiles over the active upper triangle with the Jacobian rows staged
+                # in threadgroup memory (bit-identical to the kernel below; see kernels_metal).
+                from . import kernels_metal  # noqa: PLC0415
+
+                kernels_metal.build_delassus_tiled(
+                    self._size.num_worlds,
+                    max_ncts,
                     model.info.bodies_offset,
                     model.bodies.inv_m_i,
                     data.bodies.inv_I_i,
@@ -1098,11 +1118,26 @@ class DelassusOperator:
                     jacobians.data.J_cts_data,
                     self._operator.info.dim,
                     self._operator.info.mio,
-                    # Outputs:
                     self._operator.mat,
-                ],
-                device=self._device,
-            )
+                )
+            else:
+                wp.launch(
+                    kernel=_build_delassus_elementwise_dense,
+                    dim=(self._size.num_worlds, upper_tri_size),
+                    inputs=[
+                        # Inputs:
+                        model.info.bodies_offset,
+                        model.bodies.inv_m_i,
+                        data.bodies.inv_I_i,
+                        jacobians.data.J_cts_offsets,
+                        jacobians.data.J_cts_data,
+                        self._operator.info.dim,
+                        self._operator.info.mio,
+                        # Outputs:
+                        self._operator.mat,
+                    ],
+                    device=self._device,
+                )
         else:
             jacobian_cts = jacobians._J_cts.bsm
             upper_tri_size = jacobian_cts.max_of_num_nzb * (jacobian_cts.max_of_num_nzb + 1) // 2

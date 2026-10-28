@@ -44,7 +44,7 @@ from newton._src.solvers.kamino._src.solvers.dvi.kernels import (
     _solve_dvi_inequalities_colored_pgs,
 )
 from newton._src.solvers.kamino._src.solvers.dvi.kernels_metal import _solve_bilateral_unilateral_response_columns
-from newton._src.solvers.kamino._src.solvers.padmm import PADMMSolver, PADMMWarmStartMode
+from newton._src.solvers.kamino._src.solvers.padmm import PADMMSolver, PADMMWarmStartMode, metal_fused
 from newton._src.solvers.kamino.solver_kamino import SolverKamino
 from newton.tests.kamino import setup_tests, test_context
 from newton.tests.kamino import test_kamino_solver_kamino_joint_friction as joint_friction
@@ -85,12 +85,16 @@ def _padmm_builder():
     return builder
 
 
-def _padmm_solve(device, block_dim=None):
+def _padmm_solve(device, block_dim=None, fused=None, builder_fn=_padmm_builder, captured=False):
+    """One accelerated PADMM solve; ``fused`` forces (True) or disables (False) the fused Metal loop."""
     orig = PADMMSolver._project_dual_convergence_accel_block_dim
     if block_dim is not None:
         PADMMSolver._project_dual_convergence_accel_block_dim = lambda self: block_dim
+    patch = mock.patch.object(metal_fused, "fused_padmm_enabled", return_value=bool(fused))
     try:
-        test = TestSetup(builder_fn=_padmm_builder, max_world_contacts=64, device=device)
+        if fused is not None:
+            patch.start()
+        test = TestSetup(builder_fn=builder_fn, max_world_contacts=64, device=device)
         config = PADMMSolver.Config()
         config.primal_tolerance = config.dual_tolerance = config.compl_tolerance = 1e-6
         config.max_iterations = 300
@@ -98,14 +102,32 @@ def _padmm_solve(device, block_dim=None):
         test.build()
         solver.reset()
         solver.coldstart()
-        solver.solve(problem=test.problem)
+        if captured:
+            with wp.ScopedCapture(device=device) as capture:
+                solver.solve(problem=test.problem)
+            wp.capture_launch(capture.graph)
+        else:
+            solver.solve(problem=test.problem)
         return (
             solver.data.status.numpy(),
             solver.data.solution.lambdas.numpy(),
             int(test.problem.data.dim.numpy().max()),
+            solver,
+            test,
         )
     finally:
+        if fused is not None:
+            patch.stop()
         PADMMSolver._project_dual_convergence_accel_block_dim = orig
+
+
+def _padmm_mixed_worlds_builder():
+    # Worlds that converge after different iteration counts (and one with joint rows only).
+    builder = newton.ModelBuilder()
+    builder.add_world(_padmm_builder())
+    builder.add_world(basics.build_box_on_plane())
+    builder.add_world(basics.build_boxes_fourbar())
+    return builder
 
 
 def _dvi_pgs_builders():
@@ -470,9 +492,10 @@ class TestKaminoMetalLanes(unittest.TestCase):
         np.testing.assert_allclose(x_m, x_c, rtol=1e-4, atol=1e-5)
 
     def test_padmm_projection_with_more_rows_than_lanes(self):
-        st_c, lam_c, ncts = _padmm_solve("cpu")
-        st_1, lam_1, _ = _padmm_solve(self.metal, block_dim=1)
-        st_32, lam_32, ncts_m = _padmm_solve(self.metal)
+        # The per-kernel iteration loop (the fused Metal loop would ignore the block width).
+        st_c, lam_c, ncts, *_ = _padmm_solve("cpu")
+        st_1, lam_1, *_ = _padmm_solve(self.metal, block_dim=1, fused=False)
+        st_32, lam_32, ncts_m, *_ = _padmm_solve(self.metal, fused=False)
         self.assertEqual(ncts, ncts_m)
         self.assertGreater(ncts, 32, "the test needs several rows per lane")
         self.assertTrue(bool(st_32["converged"][0]))
@@ -485,6 +508,193 @@ class TestKaminoMetalLanes(unittest.TestCase):
         # CPU runs the same algorithm with different rounding (iteration counts may differ).
         self.assertTrue(bool(st_c["converged"][0]))
         np.testing.assert_allclose(lam_32, lam_c, rtol=1e-3, atol=1e-5)
+
+    def test_fused_padmm_matches_kernel_loop_and_cpu(self):
+        """The fused Metal PADMM loop (one dispatch per solve) against the per-kernel loop and CPU."""
+        for name, builder_fn in (("fourbar_and_boxes", _padmm_builder), ("mixed_worlds", _padmm_mixed_worlds_builder)):
+            for captured in (False, True):
+                with self.subTest(name, captured=captured):
+                    _st_c, lam_c, *_ = _padmm_solve("cpu", builder_fn=builder_fn)
+                    st_k, lam_k, *_ = _padmm_solve(self.metal, fused=False, builder_fn=builder_fn, captured=captured)
+                    with mock.patch.object(
+                        metal_fused, "launch_fused_padmm_accel", wraps=metal_fused.launch_fused_padmm_accel
+                    ) as launch:
+                        st_f, lam_f, ncts, solver, _test = _padmm_solve(
+                            self.metal, fused=True, builder_fn=builder_fn, captured=captured
+                        )
+                    self.assertEqual(launch.call_count, 1, "the fused loop must replace the iteration loop")
+                    self.assertGreater(ncts, 32, "the test needs several panels")
+                    self.assertEqual(int(solver.data.state.done.numpy()[0]), 0)
+                    nw = st_f.shape[0]
+                    for w in range(nw):
+                        self.assertEqual(bool(st_f["converged"][w]), bool(st_k["converged"][w]), f"world {w}")
+                        self.assertTrue(bool(st_f["converged"][w]), f"world {w}")
+                        # The iterates agree to rounding, but the restart test (r_a < 0.999 r_a_p) flips on
+                        # rounding late in the solve, so iteration counts differ like CPU vs Metal (here
+                        # 109 / 96 / 64 for CPU / kernel loop / fused): not compared.
+                        self.assertGreater(int(st_f["iterations"][w]), 1, f"world {w}")
+                    np.testing.assert_allclose(lam_f, lam_k, rtol=1e-4, atol=1e-6)
+                    np.testing.assert_allclose(lam_f, lam_c, rtol=1e-3, atol=1e-5)
+                    for field in ("r_p", "r_d", "r_c"):
+                        self.assertTrue(np.all(st_f[field] <= 1e-6), field)
+
+    def test_fused_padmm_unsupported_configs_use_kernel_loop(self):
+        """Per-world iteration budgets and info collection keep the per-kernel loop."""
+        test = TestSetup(builder_fn=_padmm_builder, max_world_contacts=64, device=self.metal)
+        config = PADMMSolver.Config()
+        solver = PADMMSolver(model=test.model, config=config, warmstart=PADMMWarmStartMode.NONE, use_acceleration=True)
+        test.build()
+        self.assertTrue(metal_fused.fused_padmm_supported(solver, test.problem))
+        solver._collect_info = True
+        self.assertFalse(metal_fused.fused_padmm_supported(solver, test.problem))
+        solver._collect_info = False
+        solver._use_acceleration = False
+        self.assertFalse(metal_fused.fused_padmm_supported(solver, test.problem))
+        solver._use_acceleration = True
+        with mock.patch.dict("os.environ", {"NEWTON_KAMINO_METAL_FUSED_PADMM": "0"}):
+            self.assertFalse(metal_fused.fused_padmm_supported(solver, test.problem))
+
+    def test_wide_llt_solve_matches_reference(self):
+        """The threadgroup-wide triangular solves of the fused loop against float64 numpy."""
+        rng = np.random.default_rng(3)
+        dims = [204, 252, 1, 31, 32, 33, 65, 0, 100, 97]
+        mio, vio, mats, rhs = [], [], [], []
+        m = v = 0
+        for n in dims:
+            A = rng.standard_normal((n, n))
+            D = A @ A.T + n * np.eye(n)
+            mats.append(np.linalg.cholesky(D).astype(np.float32) if n else np.zeros((0, 0), np.float32))
+            rhs.append(rng.standard_normal(n).astype(np.float32))
+            mio.append(m)
+            vio.append(v)
+            m += n * n
+            v += n
+        dev = self.metal
+        L = wp.array(np.concatenate([x.ravel() for x in mats]), dtype=wp.float32, device=dev)
+        b = wp.array(np.concatenate(rhs), dtype=wp.float32, device=dev)
+        dim = wp.array(dims, dtype=wp.int32, device=dev)
+        mio_w = wp.array(mio, dtype=wp.int32, device=dev)
+        vio_w = wp.array(vio, dtype=wp.int32, device=dev)
+        for tg in (64, 256, 512):
+            x = wp.zeros(v, dtype=wp.float32, device=dev)
+            metal_fused.launch_wide_llt_solve(len(dims), max(dims), dim, mio_w, vio_w, L, b, x, tg=tg)
+            xs = x.numpy()
+            for k, n in enumerate(dims):
+                if n == 0:
+                    continue
+                Lk = mats[k].astype(np.float64)
+                ref = np.linalg.solve(Lk @ Lk.T, rhs[k].astype(np.float64))
+                got = xs[vio[k] : vio[k] + n]
+                self.assertLess(np.abs(got - ref).max() / np.abs(ref).max(), 2e-6, f"tg={tg} n={n}")
+
+    def test_wide_llt_factorize_matches_lanes_and_reference(self):
+        """Threadgroup-wide Cholesky (llt_wide_metal) against the SIMD-group kernel and float64 numpy."""
+        from newton._src.solvers.kamino._src.linalg.factorize import llt_lanes, llt_wide_metal  # noqa: PLC0415
+
+        rng = np.random.default_rng(6)
+        dims = [204, 1, 31, 32, 33, 65, 0, 97, 300]
+        blocks, mio = [], []
+        m = 0
+        for n in dims:
+            X = rng.standard_normal((n, n))
+            blocks.append((X @ X.T + n * np.eye(n)).astype(np.float32))
+            mio.append(m)
+            m += n * n
+        # A last block that is not positive definite: NaN factor like the SIMD-group kernel.
+        bad = -np.eye(5, dtype=np.float32)
+        blocks.append(bad)
+        dims.append(5)
+        mio.append(m)
+        m += 25
+        dev = self.metal
+        A = wp.array(np.concatenate([b.ravel() for b in blocks]), dtype=wp.float32, device=dev)
+        dim = wp.array(dims, dtype=wp.int32, device=dev)
+        mio_w = wp.array(mio, dtype=wp.int32, device=dev)
+        L_lanes = wp.zeros(m, dtype=wp.float32, device=dev)
+        llt_lanes.llt_lanes_factorize(len(dims), dim, mio_w, A, L_lanes)
+        for tg in (64, 256, 512):
+            L_wide = wp.full(m, 7.0, dtype=wp.float32, device=dev)
+            llt_wide_metal.llt_wide_factorize(len(dims), dim, mio_w, A, L_wide, tg=tg)
+            lw, ll = L_wide.numpy(), L_lanes.numpy()
+            for k, n in enumerate(dims[:-1]):
+                if n == 0:
+                    continue
+                got = lw[mio[k] : mio[k] + n * n].reshape(n, n)
+                ref = np.linalg.cholesky(blocks[k].astype(np.float64))
+                self.assertEqual(np.abs(np.triu(got, 1)).max(), 0.0)
+                self.assertLess(np.abs(got - ref).max() / np.abs(ref).max(), 1e-6, f"tg={tg} n={n}")
+                np.testing.assert_allclose(got, ll[mio[k] : mio[k] + n * n].reshape(n, n), rtol=1e-4, atol=1e-5)
+            self.assertTrue(np.isnan(lw[mio[-1] : mio[-1] + 25]).any())
+            self.assertTrue(np.isnan(ll[mio[-1] : mio[-1] + 25]).any())
+
+    def test_metal_delassus_build_and_preconditioning_bitwise(self):
+        """Metal's Delassus build (tiles) and preconditioning (active-element loops), both in
+        dynamics/kernels_metal.py, reproduce the per-capacity-element CUDA/CPU kernels bit for bit."""
+        test = TestSetup(builder_fn=_padmm_mixed_worlds_builder, max_world_contacts=64, device=self.metal)
+        test.build()
+        D_strided = test.problem.data.D.numpy().copy()
+        P_strided = test.problem.data.P.numpy().copy()
+        dims = test.problem.data.dim.numpy()
+        self.assertGreater(int(dims.max()), 32)
+        with (
+            mock.patch("newton._src.solvers.kamino._src.dynamics.delassus.is_metal", return_value=False),
+            mock.patch("newton._src.solvers.kamino._src.dynamics.dual.is_metal", return_value=False),
+        ):
+            test.build()
+        np.testing.assert_array_equal(test.problem.data.P.numpy(), P_strided)
+        np.testing.assert_array_equal(test.problem.data.D.numpy(), D_strided)
+        # (No CPU comparison: CPU emits the contacts in another order, so D's rows are permuted.)
+
+    def test_llt_reset_zeroes_everything_written(self):
+        """Metal zeroes only the written part of each block on reset; the buffer must still equal
+        a fully zeroed one, also after the active sizes shrink."""
+        dev = self.metal
+        maxdims = [40, 64]
+        info = DenseSquareMultiLinearInfo()
+        info.finalize(dimensions=maxdims, dtype=wp.float32, device=dev)
+        rng = np.random.default_rng(7)
+        mats = []
+        for n in maxdims:
+            X = rng.standard_normal((n, n))
+            mats.append((X @ X.T + n * np.eye(n)).astype(np.float32).ravel())
+        A = wp.array(np.concatenate(mats), dtype=wp.float32, device=dev)
+        llt = LLTBlockedSolver(operator=DenseLinearOperatorData(info=info, mat=A), device=dev)
+        mio = info.mio.numpy()
+        for dims in ([33, 64], [5, 20], [0, 7]):
+            info.dim.assign(dims)
+            # A holds full-capacity SPD blocks; with row stride ``dim`` the leading dim x dim
+            # entries are another SPD-looking block only by chance, so factor a fresh SPD block.
+            host = A.numpy()
+            for k, n in enumerate(dims):
+                if n:
+                    X = rng.standard_normal((n, n))
+                    host[mio[k] : mio[k] + n * n] = (X @ X.T + n * np.eye(n)).astype(np.float32).ravel()
+            A.assign(host)
+            llt.reset()
+            llt.compute(A=A)
+            L = llt.L.numpy()
+            for k, n in enumerate(dims):
+                block = L[mio[k] : mio[k] + maxdims[k] * maxdims[k]]
+                self.assertTrue(np.all(block[n * n :] == 0.0), f"dims={dims} block {k}")
+                if n:
+                    ref = np.linalg.cholesky(host[mio[k] : mio[k] + n * n].reshape(n, n).astype(np.float64))
+                    np.testing.assert_allclose(block[: n * n].reshape(n, n), ref, rtol=1e-4, atol=1e-5)
+
+    def test_fused_division_is_ieee(self):
+        """The solve's reciprocal + Newton-correction division rounds like IEEE division."""
+        rng = np.random.default_rng(4)
+        n = 1 << 20
+        for scale in (1.0, 1e-20, 1e20):
+            a = (rng.standard_normal(n) * scale).astype(np.float32)
+            b = ((np.abs(rng.standard_normal(n)) + 1e-3) * rng.choice([1e-10, 1e-3, 1.0, 1e3, 1e10], n)).astype(
+                np.float32
+            )
+            dev = self.metal
+            out = wp.zeros(n, dtype=wp.float32, device=dev)
+            metal_fused.probe_div_rn(
+                wp.array(a, device=dev), wp.array(b, device=dev), out, wp.array([n], dtype=wp.int32, device=dev)
+            )
+            np.testing.assert_array_equal(out.numpy().view(np.int32), (a / b).view(np.int32))
 
     def test_dvi_dense_pgs_lanes_match_one_lane_bitwise(self):
         from newton._src.solvers.kamino._src.solvers.dvi.kernels_metal import dense_pgs_rows_kernel  # noqa: PLC0415
