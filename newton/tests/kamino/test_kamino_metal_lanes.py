@@ -631,9 +631,9 @@ class TestKaminoMetalLanes(unittest.TestCase):
             self.assertTrue(np.isnan(lw[mio[-1] : mio[-1] + 25]).any())
             self.assertTrue(np.isnan(ll[mio[-1] : mio[-1] + 25]).any())
 
-    def test_strided_delassus_build_and_preconditioning_bitwise(self):
-        """Metal's active-element loops (dynamics/kernels_metal.py) reproduce the per-capacity-element
-        CUDA/CPU kernels bit for bit."""
+    def test_metal_delassus_build_and_preconditioning_bitwise(self):
+        """Metal's Delassus build (tiles) and preconditioning (active-element loops), both in
+        dynamics/kernels_metal.py, reproduce the per-capacity-element CUDA/CPU kernels bit for bit."""
         test = TestSetup(builder_fn=_padmm_mixed_worlds_builder, max_world_contacts=64, device=self.metal)
         test.build()
         D_strided = test.problem.data.D.numpy().copy()
