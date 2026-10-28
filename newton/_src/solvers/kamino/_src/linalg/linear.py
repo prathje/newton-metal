@@ -25,7 +25,7 @@ from .....utils.device import is_metal
 from . import conjugate, factorize
 from .conjugate_fused import MAX_BLOCKS_PER_ROW, build_row_index, build_transpose_index, make_fused_cr_kernel
 from .core import DenseLinearOperatorData, DenseSquareMultiLinearInfo, make_dtype_tolerance
-from .factorize import llt_lanes
+from .factorize import llt_lanes, llt_wide_metal
 from .sparse_matrix import (
     BlockSparseMatrices,
     allocate_block_sparse_from_dense,
@@ -535,6 +535,18 @@ class LLTSequentialSolver(DirectSolver[ScalarType, IndexType]):
         self._y.zero_()
         self._has_factors = False
 
+    def _lanes_factorize(self, dim: wp.array[IndexType], A: wp.array[ScalarType]) -> None:
+        # Metal: one threadgroup per block (``llt_wide_metal``), or one SIMD group per block
+        # (``llt_lanes``) when NEWTON_KAMINO_METAL_WIDE_LLT=0.
+        if llt_wide_metal.llt_wide_enabled():
+            llt_wide_metal.llt_wide_factorize(
+                num_blocks=self._operator.info.num_blocks, dim=dim, mio=self._operator.info.mio, A=A, L=self._L
+            )
+        else:
+            llt_lanes.llt_lanes_factorize(
+                num_blocks=self._operator.info.num_blocks, dim=dim, mio=self._operator.info.mio, A=A, L=self._L
+            )
+
     @override
     def _factorize_impl(self, A: wp.array[ScalarType]) -> None:
         factorize.llt_sequential_factorize(
@@ -707,16 +719,22 @@ class LLTBlockedSolver(DirectSolver[ScalarType, IndexType]):
         # use the lane-parallel kernels there (see ``factorize.llt_lanes``).
         return self._dtype == wp.float32 and is_metal(self._device)
 
+    def _lanes_factorize(self, dim: wp.array[IndexType], A: wp.array[ScalarType]) -> None:
+        # Metal: one threadgroup per block (``llt_wide_metal``), or one SIMD group per block
+        # (``llt_lanes``) when NEWTON_KAMINO_METAL_WIDE_LLT=0.
+        if llt_wide_metal.llt_wide_enabled():
+            llt_wide_metal.llt_wide_factorize(
+                num_blocks=self._operator.info.num_blocks, dim=dim, mio=self._operator.info.mio, A=A, L=self._L
+            )
+        else:
+            llt_lanes.llt_lanes_factorize(
+                num_blocks=self._operator.info.num_blocks, dim=dim, mio=self._operator.info.mio, A=A, L=self._L
+            )
+
     @override
     def _factorize_impl(self, A: wp.array[ScalarType]) -> None:
         if self._use_lanes():
-            llt_lanes.llt_lanes_factorize(
-                num_blocks=self._operator.info.num_blocks,
-                dim=self._operator.info.dim,
-                mio=self._operator.info.mio,
-                A=A,
-                L=self._L,
-            )
+            self._lanes_factorize(self._operator.info.dim, A)
         else:
             factorize.llt_blocked_factorize(
                 kernel=self._factorize_kernel,
@@ -748,13 +766,7 @@ class LLTBlockedSolver(DirectSolver[ScalarType, IndexType]):
             if self._use_lanes():
                 # Metal: refactorize the flagged blocks with the lane-parallel kernel, which
                 # also leaves zero-dimension (unflagged) blocks untouched.
-                llt_lanes.llt_lanes_factorize(
-                    num_blocks=info.num_blocks,
-                    dim=self._retry_dim,
-                    mio=info.mio,
-                    A=A,
-                    L=self._L,
-                )
+                self._lanes_factorize(self._retry_dim, A)
             else:
                 factorize.llt_blocked_factorize(
                     kernel=self._factorize_kernel,

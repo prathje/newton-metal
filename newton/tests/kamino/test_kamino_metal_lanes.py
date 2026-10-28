@@ -591,6 +591,46 @@ class TestKaminoMetalLanes(unittest.TestCase):
                 got = xs[vio[k] : vio[k] + n]
                 self.assertLess(np.abs(got - ref).max() / np.abs(ref).max(), 2e-6, f"tg={tg} n={n}")
 
+    def test_wide_llt_factorize_matches_lanes_and_reference(self):
+        """Threadgroup-wide Cholesky (llt_wide_metal) against the SIMD-group kernel and float64 numpy."""
+        from newton._src.solvers.kamino._src.linalg.factorize import llt_lanes, llt_wide_metal  # noqa: PLC0415
+
+        rng = np.random.default_rng(6)
+        dims = [204, 1, 31, 32, 33, 65, 0, 97, 300]
+        blocks, mio = [], []
+        m = 0
+        for n in dims:
+            X = rng.standard_normal((n, n))
+            blocks.append((X @ X.T + n * np.eye(n)).astype(np.float32))
+            mio.append(m)
+            m += n * n
+        # A last block that is not positive definite: NaN factor like the SIMD-group kernel.
+        bad = -np.eye(5, dtype=np.float32)
+        blocks.append(bad)
+        dims.append(5)
+        mio.append(m)
+        m += 25
+        dev = self.metal
+        A = wp.array(np.concatenate([b.ravel() for b in blocks]), dtype=wp.float32, device=dev)
+        dim = wp.array(dims, dtype=wp.int32, device=dev)
+        mio_w = wp.array(mio, dtype=wp.int32, device=dev)
+        L_lanes = wp.zeros(m, dtype=wp.float32, device=dev)
+        llt_lanes.llt_lanes_factorize(len(dims), dim, mio_w, A, L_lanes)
+        for tg in (64, 256, 512):
+            L_wide = wp.full(m, 7.0, dtype=wp.float32, device=dev)
+            llt_wide_metal.llt_wide_factorize(len(dims), dim, mio_w, A, L_wide, tg=tg)
+            lw, ll = L_wide.numpy(), L_lanes.numpy()
+            for k, n in enumerate(dims[:-1]):
+                if n == 0:
+                    continue
+                got = lw[mio[k] : mio[k] + n * n].reshape(n, n)
+                ref = np.linalg.cholesky(blocks[k].astype(np.float64))
+                self.assertEqual(np.abs(np.triu(got, 1)).max(), 0.0)
+                self.assertLess(np.abs(got - ref).max() / np.abs(ref).max(), 1e-6, f"tg={tg} n={n}")
+                np.testing.assert_allclose(got, ll[mio[k] : mio[k] + n * n].reshape(n, n), rtol=1e-4, atol=1e-5)
+            self.assertTrue(np.isnan(lw[mio[-1] : mio[-1] + 25]).any())
+            self.assertTrue(np.isnan(ll[mio[-1] : mio[-1] + 25]).any())
+
     def test_fused_division_is_ieee(self):
         """The solve's reciprocal + Newton-correction division rounds like IEEE division."""
         rng = np.random.default_rng(4)
