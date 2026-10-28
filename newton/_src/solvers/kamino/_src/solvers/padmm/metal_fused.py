@@ -180,7 +180,11 @@ struct KArgs {{
 
 // a / b from the reciprocal ib = 1 / b with one Newton correction (Markstein): the
 // quotient comes out correctly rounded like IEEE division, in two fma instead of the
-// longer precise-division sequence on the triangular solve's critical path.
+// longer precise-division sequence on the triangular solve's critical path. This holds
+// for finite non-zero b with a normal 1 / b, |a| >= 2^-100 and a normal finite quotient
+// (test_fused_division_is_ieee). Outside that range it differs from IEEE: |a| < 2^-100
+// can be off by one ulp (the residual fma(-q, b, a) is flushed to zero), and b = 0,
+// b = +-inf or an overflowing quotient give NaN instead of +-inf / 0.
 static inline float div_rn(float a, float b, float ib)
 {
     const float q = a * ib;
@@ -832,8 +836,14 @@ def _dispatch(entry: str, num_worlds: int, max_dim: int, arrays: dict, modes: di
             mode = "rw"
         resources[id(buf)] = (buf, mode)
     packed = struct.pack(_ARG_FMT, *addrs, int(has_atol), 0)
+    pso = _pso(entry, tg, _ncap(max_dim))
+    if int(pso.maxTotalThreadsPerThreadgroup()) < tg:
+        raise RuntimeError(
+            f"Kamino fused PADMM: {entry} allows at most {int(pso.maxTotalThreadsPerThreadgroup())} threads per "
+            f"threadgroup on this GPU, the launch needs {tg} (set NEWTON_KAMINO_METAL_PADMM_TG)"
+        )
     get_dispatcher().dispatch(
-        _pso(entry, tg, _ncap(max_dim)),
+        pso,
         [(packed, len(packed))],
         (tg * num_worlds, 1, 1),
         (tg, 1, 1),
@@ -865,8 +875,18 @@ def fused_padmm_supported(solver, problem) -> bool:
     iters = {int(c.max_iterations) for c in solver._config}
     if len(iters) != 1 or min(iters) < 1:
         return False
+    # The kernel implements the fixed and balanced penalty updates only (``update_penalty``).
+    methods = {PADMMPenaltyUpdate.from_string(c.penalty_update_method) for c in solver._config}
+    if not methods <= {PADMMPenaltyUpdate.FIXED, PADMMPenaltyUpdate.BALANCED}:
+        return False
+    # The solve vector of every world must fit the threadgroup array sized from the solver's capacity.
+    ncap = _ncap(solver._size.max_of_max_total_cts)
+    if max(getattr(delassus, "_world_maxdims", None) or [0]) > ncap:
+        return False
     tg = _tg_for(solver._size.num_worlds, FUSED_TG_SIZE)
-    return _tg_bytes(tg, _ncap(solver._size.max_of_max_total_cts)) <= _max_tg_memory()
+    if _tg_bytes(tg, ncap) > _max_tg_memory():
+        return False
+    return int(_pso("kamino_padmm_accel_dense", tg, ncap).maxTotalThreadsPerThreadgroup()) >= tg
 
 
 def _tg_bytes(tg: int, ncap: int) -> int:

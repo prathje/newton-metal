@@ -55,7 +55,9 @@ using namespace metal;
 #define NSG (TG / 32)
 
 // a / b from the reciprocal ib = 1 / b with one Newton correction (Markstein): rounds
-// like IEEE division (see test_fused_division_is_ieee).
+// like IEEE division for finite non-zero b, |a| >= 2^-100 and a normal quotient (see
+// test_fused_division_is_ieee and div_rn in padmm/metal_fused.py); a zero pivot gives
+// NaN instead of +-inf below it (flagged for the failed-pivot retry either way).
 static inline float div_rn(float a, float b, float ib)
 {
     const float q = a * ib;
@@ -257,8 +259,14 @@ def llt_wide_factorize(
         tg = 512 if num_blocks <= 32 else 256
     if tg < 32 or tg % 32 != 0:
         raise ValueError(f"Kamino wide LLT: threadgroup size must be a multiple of 32, got {tg}")
+    pso = _pso(tg)
+    if int(pso.maxTotalThreadsPerThreadgroup()) < tg:
+        raise RuntimeError(
+            f"Kamino wide LLT: the kernel allows at most {int(pso.maxTotalThreadsPerThreadgroup())} threads per "
+            f"threadgroup on this GPU, the launch needs {tg} (set NEWTON_KAMINO_METAL_LLT_TG)"
+        )
     get_dispatcher().dispatch(
-        _pso(tg),
+        pso,
         [_slice(dim), _slice(mio), _slice(A), _slice(L)],
         (tg * num_blocks, 1, 1),
         (tg, 1, 1),

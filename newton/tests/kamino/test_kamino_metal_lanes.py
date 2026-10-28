@@ -553,6 +553,11 @@ class TestKaminoMetalLanes(unittest.TestCase):
         solver._use_acceleration = True
         with mock.patch.dict("os.environ", {"NEWTON_KAMINO_METAL_FUSED_PADMM": "0"}):
             self.assertFalse(metal_fused.fused_padmm_supported(solver, test.problem))
+        # A Delassus capacity beyond the threadgroup vector sized from the solver would overflow it.
+        delassus = test.problem._delassus
+        with mock.patch.object(delassus, "_world_maxdims", [solver._size.max_of_max_total_cts + 64]):
+            self.assertFalse(metal_fused.fused_padmm_supported(solver, test.problem))
+        self.assertTrue(metal_fused.fused_padmm_supported(solver, test.problem))
 
     def test_wide_llt_solve_matches_reference(self):
         """The threadgroup-wide triangular solves of the fused loop against float64 numpy."""
