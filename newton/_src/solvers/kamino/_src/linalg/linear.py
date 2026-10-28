@@ -695,6 +695,11 @@ class LLTBlockedSolver(DirectSolver[ScalarType, IndexType]):
             self._L = wp.zeros(shape=(self._operator.info.total_mat_size,), dtype=self._dtype)
             self._y = wp.zeros(shape=(self._operator.info.total_vec_size,), dtype=self._dtype)
             self._retry_dim = wp.zeros(shape=(self._operator.info.num_blocks,), dtype=wp.int32)
+        # Metal: the written-extent record of the partial reset, allocated here, outside any graph
+        # capture (allocated lazily inside a capture, its zero fill would be replayed every step).
+        self._metal_written_extent = None
+        if self._use_lanes():
+            self._metal_extent()
 
     @override
     def _reset_impl(self) -> None:

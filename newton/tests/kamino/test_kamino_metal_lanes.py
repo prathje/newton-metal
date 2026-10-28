@@ -745,6 +745,50 @@ class TestKaminoMetalLanes(unittest.TestCase):
                 delassus.zero()
                 self.assertEqual(np.count_nonzero(delassus.D.numpy()), 0)
 
+    def test_partial_zeroing_when_first_used_inside_a_graph_capture(self):
+        """The examples capture the very first step. The written-extent record must not be
+        allocated inside that capture: its zero fill would then be replayed every step and a
+        replay at a smaller size would leave the larger previous replay's entries."""
+        dev = self.metal
+        with self.subTest("llt"):
+            maxdims = [40, 64]
+            info = DenseSquareMultiLinearInfo()
+            info.finalize(dimensions=maxdims, dtype=wp.float32, device=dev)
+            mio = info.mio.numpy()
+            host = np.zeros(sum(n * n for n in maxdims), np.float32)
+            rng = np.random.default_rng(5)
+            for k, n in enumerate(maxdims):
+                X = rng.standard_normal((n, n))
+                host[mio[k] : mio[k] + n * n] = (X @ X.T + n * np.eye(n)).astype(np.float32).ravel()
+            A = wp.array(host, dtype=wp.float32, device=dev)
+            llt = LLTBlockedSolver(operator=DenseLinearOperatorData(info=info, mat=A), device=dev)
+            info.dim.assign(maxdims)
+            with wp.ScopedCapture(device=dev) as capture:
+                llt.reset()
+                llt.compute(A=A)
+            wp.capture_launch(capture.graph)
+            self.assertGreater(np.count_nonzero(llt.L.numpy()), 25 + 49)
+            info.dim.assign([3, 4])
+            wp.capture_launch(capture.graph)
+            L = llt.L.numpy()
+            active = sum(np.count_nonzero(L[mio[k] : mio[k] + n * n]) for k, n in enumerate([3, 4]))
+            self.assertEqual(np.count_nonzero(L), active)
+        with self.subTest("delassus"):
+            test = TestSetup(builder_fn=_padmm_mixed_worlds_builder, max_world_contacts=64, device=dev)
+            delassus = test.problem.delassus
+            maxdims = np.array(delassus._world_maxdims, np.int32)
+            nw = len(maxdims)
+            eta = wp.full(delassus.info.total_vec_size, 1.0, dtype=wp.float32, device=dev)
+            delassus.info.dim.assign(maxdims)
+            with wp.ScopedCapture(device=dev) as capture:
+                delassus.zero()
+                delassus.regularize(eta)
+            wp.capture_launch(capture.graph)
+            self.assertEqual(np.count_nonzero(delassus.D.numpy()), int(maxdims.sum()))
+            delassus.info.dim.assign(np.full(nw, 2, np.int32))
+            wp.capture_launch(capture.graph)
+            self.assertEqual(np.count_nonzero(delassus.D.numpy()), 2 * nw)
+
     def test_fused_division_is_ieee(self):
         """The solve's reciprocal + Newton-correction division rounds like IEEE division."""
         rng = np.random.default_rng(4)

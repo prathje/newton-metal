@@ -1019,6 +1019,12 @@ class DelassusOperator:
         else:
             self._operator.info.finalize(dimensions=maxdims, dtype=wp.float32, itype=wp.int32, device=self._device)
 
+        # Metal: allocate the written-extent record of the partial zeroing now, outside any graph
+        # capture (allocated lazily inside a capture, its zero fill would be replayed every step).
+        self._metal_written_extent = None
+        if is_metal(self._device) and self._world_maxdims:
+            self._metal_extent()
+
         # Optionally initialize the linear system solver if one is specified
         if solver is not None:
             if not issubclass(solver, LinearSolverType):
