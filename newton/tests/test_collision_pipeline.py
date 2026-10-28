@@ -7815,36 +7815,132 @@ add_function_test(
 )
 
 
-def test_metal_full_surface_mesh_contacts_raise(test, device):
-    """Full-surface soft contacts against meshes fail loudly on Metal, before any contact is written."""
+def _full_surface_mesh_contact_rows(device, scene):
+    """Collide one full-surface mesh scene; return {feature key: (mask, ints, floats)} for its rows."""
+    rng = np.random.default_rng(7)
     builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
-    body = builder.add_body()
-    builder.add_shape_mesh(body, mesh=newton.Mesh.create_box(0.2, 0.2, 0.05))
-    builder.add_cloth_grid(
-        pos=wp.vec3(-0.24, -0.24, 0.055),
-        rot=wp.quat_identity(),
-        vel=wp.vec3(),
-        dim_x=4,
-        dim_y=4,
-        cell_x=0.12,
-        cell_y=0.12,
-        mass=0.1,
-        particle_radius=0.03,
-    )
+    if scene == "pad":
+        # A soft edge pinched through a box-mesh pad: edge penetration (ray/triangle) records.
+        half = 0.03
+        vertices = np.array(
+            [[x, y, z] for z in (-half, half) for y in (-half, half) for x in (-half, half)], dtype=np.float32
+        )
+        faces = np.array(
+            [
+                [0, 2, 1],
+                [1, 2, 3],
+                [4, 5, 6],
+                [5, 7, 6],
+                [0, 1, 4],
+                [1, 5, 4],
+                [2, 6, 3],
+                [3, 6, 7],
+                [0, 4, 2],
+                [2, 4, 6],
+                [1, 3, 5],
+                [3, 7, 5],
+            ],
+            dtype=np.int32,
+        )
+        rotation = wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), 1.1)
+        origin = wp.vec3(31.7, -12.2, 44.0)
+        pad = builder.add_body(xform=wp.transform(origin, rotation))
+        builder.add_shape_mesh(pad, mesh=newton.Mesh(vertices, faces.reshape(-1), compute_inertia=False))
+        builder.add_cloth_grid(
+            pos=origin + wp.quat_rotate(rotation, wp.vec3(-0.12, half - 0.015, 0.0)),
+            rot=rotation,
+            vel=wp.vec3(),
+            dim_x=1,
+            dim_y=1,
+            cell_x=0.24,
+            cell_y=0.06,
+            mass=0.1,
+            particle_radius=0.01,
+        )
+        gap, noise = 0.01, 0.0
+    else:
+        # Perturbed cloth over a rotated, non-uniformly scaled box / sphere mesh on a body.
+        mesh = (
+            newton.Mesh.create_box(0.2, 0.2, 0.05, compute_inertia=False)
+            if scene == "box"
+            else newton.Mesh.create_sphere(0.2, num_latitudes=12, num_longitudes=12, compute_inertia=False)
+        )
+        body = builder.add_body(
+            xform=wp.transform(
+                wp.vec3(0.01, -0.02, 0.0), wp.quat_from_axis_angle(wp.normalize(wp.vec3(0.2, 1.0, 0.3)), 0.4)
+            )
+        )
+        builder.add_shape_mesh(body, mesh=mesh, scale=wp.vec3(1.3, 0.8, 1.1))
+        builder.add_cloth_grid(
+            pos=wp.vec3(-0.24, -0.24, 0.055 if scene == "box" else 0.18),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(),
+            dim_x=16,
+            dim_y=16,
+            cell_x=0.03,
+            cell_y=0.03,
+            mass=0.1,
+            particle_radius=0.005,
+        )
+        gap, noise = 0.03, 0.01
     model = builder.finalize(device=device)
-    with test.assertRaisesRegex(NotImplementedError, "not supported on Metal"):
-        newton.CollisionPipeline(model, enable_rigid_soft_full_surface_contact=True, soft_contact_max=1024)
-    # The default per-particle soft contact path is unaffected.
-    pipeline = newton.CollisionPipeline(model, soft_contact_max=1024)
+    state = model.state()
+    q = state.particle_q.numpy()
+    state.particle_q.assign(q + rng.normal(scale=noise, size=q.shape).astype(np.float32))
+    pipeline = newton.CollisionPipeline(
+        model, broad_phase="nxn", soft_contact_gap=gap, enable_rigid_soft_full_surface_contact=True
+    )
     contacts = pipeline.contacts()
-    pipeline.collide(model.state(), contacts)
-    test.assertGreater(int(contacts.soft_contact_count.numpy()[0]), 0)
+    pipeline.collide(state, contacts)
+    count = min(int(contacts.soft_contact_count.numpy()[0]), contacts.soft_contact_max)
+    mask = evaluate_soft_contact_force_mask(model, state, contacts).numpy()[:count]
+    features = contacts._soft_contact_mesh_features.numpy()[:count]
+    shapes = contacts.soft_contact_shape.numpy()[:count]
+    ints = np.column_stack(
+        (contacts.soft_contact_particle.numpy()[:count], contacts.soft_contact_indices.numpy()[:count])
+    )
+    floats = np.column_stack(
+        [
+            getattr(contacts, name).numpy()[:count]
+            for name in ("soft_contact_barycentric", "soft_contact_body_pos", "soft_contact_normal")
+        ]
+        + [contacts._soft_contact_mesh_params.numpy()[:count, None]]
+    )
+    rows = {}
+    for i in range(count):
+        key = (*features[i].tolist(), int(shapes[i]))
+        if features[i][0] < 0:
+            key = (-1, *ints[i].tolist(), int(shapes[i]))
+        rows.setdefault(key, []).append((bool(mask[i]), ints[i].tolist(), floats[i]))
+    return rows
+
+
+def test_metal_full_surface_mesh_contacts_match_cpu(test, device):
+    """Full-surface mesh soft contacts on Metal report the CPU's records, force mask and geometry.
+
+    Metal appends records in a different slot order, so rows are matched by their feature key.
+    """
+    for scene in ("box", "sphere", "pad"):
+        with test.subTest(scene=scene):
+            cpu = _full_surface_mesh_contact_rows("cpu", scene)
+            metal = _full_surface_mesh_contact_rows(device, scene)
+            test.assertGreater(len(cpu), 0)
+            test.assertEqual(set(cpu), set(metal))
+            test.assertTrue(any(key[0] >= 0 for key in cpu))
+            if scene == "pad":
+                test.assertTrue(any(key[0] >= 0 and key[0] & 7 == 3 for key in cpu))  # edge-depth records
+            for key, rows in cpu.items():
+                test.assertEqual(len(rows), len(metal[key]), key)
+                for (mask_c, ints_c, floats_c), (mask_m, ints_m, floats_m) in zip(rows, metal[key], strict=True):
+                    test.assertEqual(mask_c, mask_m, key)
+                    test.assertEqual(ints_c, ints_m, key)
+                    np.testing.assert_allclose(floats_m, floats_c, rtol=0.0, atol=1.0e-3, err_msg=str(key))
 
 
 add_function_test(
     TestCollisionPipeline,
-    "test_metal_full_surface_mesh_contacts_raise",
-    test_metal_full_surface_mesh_contacts_raise,
+    "test_metal_full_surface_mesh_contacts_match_cpu",
+    test_metal_full_surface_mesh_contacts_match_cpu,
     devices=_metal_devices,
 )
 
