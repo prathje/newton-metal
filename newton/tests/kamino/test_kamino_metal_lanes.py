@@ -685,6 +685,66 @@ class TestKaminoMetalLanes(unittest.TestCase):
                     ref = np.linalg.cholesky(host[mio[k] : mio[k] + n * n].reshape(n, n).astype(np.float64))
                     np.testing.assert_allclose(block[: n * n].reshape(n, n), ref, rtol=1e-4, atol=1e-5)
 
+    def test_llt_reset_after_unreset_larger_write_zeroes_everything(self):
+        """A factorization at a larger size without a reset in between (``compute()`` without
+        ``reset()``) must still be covered by the next ``reset()`` at a smaller size."""
+        dev = self.metal
+        maxdims = [40, 64]
+        info = DenseSquareMultiLinearInfo()
+        info.finalize(dimensions=maxdims, dtype=wp.float32, device=dev)
+        rng = np.random.default_rng(3)
+        host = np.zeros(sum(n * n for n in maxdims), np.float32)
+        A = wp.array(host, dtype=wp.float32, device=dev)
+        llt = LLTBlockedSolver(operator=DenseLinearOperatorData(info=info, mat=A), device=dev)
+        mio = info.mio.numpy()
+
+        def spd_blocks(dims):
+            h = A.numpy()
+            for k, n in enumerate(dims):
+                if n:
+                    X = rng.standard_normal((n, n))
+                    h[mio[k] : mio[k] + n * n] = (X @ X.T + n * np.eye(n)).astype(np.float32).ravel()
+            A.assign(h)
+
+        info.dim.assign([5, 7])
+        spd_blocks([5, 7])
+        llt.reset()
+        llt.compute(A=A)
+        info.dim.assign([40, 64])  # grow, factorize without a reset
+        spd_blocks([40, 64])
+        llt.compute(A=A)
+        self.assertGreater(np.count_nonzero(llt.L.numpy()), 25 + 49)
+        info.dim.assign([5, 7])
+        llt.reset()
+        self.assertEqual(np.count_nonzero(llt.L.numpy()), 0)
+
+    def test_delassus_zero_after_unzeroed_larger_write_zeroes_everything(self):
+        """``DelassusOperator.zero()`` sets all values to zero, also after a writer ran at a larger
+        size without a zeroing in between (``build(reset_to_zero=False)``, ``regularize``)."""
+        test = TestSetup(builder_fn=_padmm_mixed_worlds_builder, max_world_contacts=64, device=self.metal)
+        test.build()
+        delassus = test.problem.delassus
+        dims = delassus.info.dim.numpy().copy()
+        maxdims = np.array(delassus._world_maxdims)
+        self.assertTrue(np.all(maxdims > 8))
+        nw = len(dims)
+        eta = wp.full(delassus.info.total_vec_size, 1.0, dtype=wp.float32, device=self.metal)
+        for writer in ("regularize", "build"):
+            with self.subTest(writer):
+                delassus.info.dim.assign(np.full(nw, 2, np.int32))
+                delassus.zero()
+                self.assertEqual(np.count_nonzero(delassus.D.numpy()), 0)
+                if writer == "regularize":
+                    delassus.info.dim.assign(maxdims.astype(np.int32))
+                    delassus.regularize(eta)
+                else:
+                    delassus.info.dim.assign(dims)
+                    delassus.build(test.model, test.data, test.jacobians, reset_to_zero=False)
+                self.assertGreater(np.count_nonzero(delassus.D.numpy()), 4 * nw)
+                delassus.info.dim.assign(np.full(nw, 2, np.int32))
+                delassus.zero()
+                self.assertEqual(np.count_nonzero(delassus.D.numpy()), 0)
+
     def test_fused_division_is_ieee(self):
         """The solve's reciprocal + Newton-correction division rounds like IEEE division."""
         rng = np.random.default_rng(4)

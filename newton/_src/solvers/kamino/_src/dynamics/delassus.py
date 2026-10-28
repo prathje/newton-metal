@@ -1032,22 +1032,33 @@ class DelassusOperator:
         This is useful for resetting the operator before recomputing it.
         """
         if is_metal(self._device) and self._world_maxdims:
-            # Metal: only the part any build wrote (zeroing the whole capacity costs ~10 ms per
+            # Metal: only the part any writer wrote (zeroing the whole capacity costs ~10 ms per
             # call with 128 anymal_d worlds); the resulting buffer is the same.
             from . import kernels_metal  # noqa: PLC0415
 
-            if getattr(self, "_metal_written_extent", None) is None:
-                self._metal_written_extent = wp.zeros(self._num_worlds, dtype=wp.int32, device=self._device)
             kernels_metal.zero_written(
                 self._num_worlds,
                 max(self._world_maxdims),
                 self._operator.info.dim,
                 self._operator.info.mio,
-                self._metal_written_extent,
+                self._metal_extent(),
                 self._operator.mat,
             )
             return
         self._operator.mat.zero_()
+
+    def _metal_extent(self) -> wp.array:
+        """Metal: per-world largest block size written since allocation (see ``kernels_metal``)."""
+        if getattr(self, "_metal_written_extent", None) is None:
+            self._metal_written_extent = wp.zeros(self._num_worlds, dtype=wp.int32, device=self._device)
+        return self._metal_written_extent
+
+    def _metal_note_written(self) -> None:
+        """Metal: record the current block sizes before writing the dense matrix (no-op elsewhere)."""
+        if is_metal(self._device) and self._world_maxdims and self._operator.mat is not None:
+            from . import kernels_metal  # noqa: PLC0415
+
+            kernels_metal.note_written(self._num_worlds, self._operator.info.dim, self._metal_extent())
 
     def build(
         self,
@@ -1093,6 +1104,7 @@ class DelassusOperator:
         # Initialize the Delassus matrix to zero
         if reset_to_zero:
             self.zero()
+        self._metal_note_written()
 
         # Build the Delassus matrix parallelized over the upper triangle. Warp's
         # CUDA kernels use 32-thread warps, so pad the work count to keep the
@@ -1206,6 +1218,7 @@ class DelassusOperator:
             Each value in `eta` corresponds to the regularization along each constraint.
             Shape of ``(sum_of_max_total_cts,)``.
         """
+        self._metal_note_written()
         wp.launch(
             kernel=_regularize_delassus_diagonal_dense,
             dim=(self._size.num_worlds, self._size.max_of_max_total_cts),

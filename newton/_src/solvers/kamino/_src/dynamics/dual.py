@@ -1971,6 +1971,7 @@ class DualProblem:
         (``kernels_metal``; bit-identical, without one thread per capacity entry)."""
         from . import kernels_metal  # noqa: PLC0415
 
+        self.delassus._metal_note_written()
         stride = kernels_metal.metal_stride(self._size.num_worlds, capacity)
         wp.launch(
             kernels_metal.apply_dual_preconditioner_to_matrix_strided,

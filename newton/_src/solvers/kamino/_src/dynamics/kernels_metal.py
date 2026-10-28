@@ -222,9 +222,11 @@ def zero_written_blocks(
 ):
     """Zero ``X[mio[w] : mio[w] + e * e]`` with ``e = max(extent[w], dim[w])`` and record ``e``.
 
-    Every writer of a world's block writes inside ``[0, dim^2)`` (row stride ``dim``), so
-    ``extent`` (the largest ``dim`` since allocation) bounds everything ever written: the
-    result equals zeroing the whole capacity. All threads of a world store the same ``e``.
+    Every writer of a world's block writes inside ``[0, dim^2)`` (row stride ``dim``) and
+    records its ``dim`` in ``extent`` (:func:`note_written`) before writing, so ``extent`` is
+    the largest ``dim`` any write used since allocation and bounds everything ever written:
+    the result equals zeroing the whole capacity, also when a block was written at a larger
+    size between two zeroings. All threads of a world store the same ``e``.
     """
     wid, lane = wp.tid()
     e = wp.max(extent[wid], dim[wid])
@@ -239,3 +241,22 @@ def zero_written(num_worlds: int, max_dim: int, dim, mio, extent, X) -> None:
     """Metal: zero the written part of each world's dense ``max_dim``-capacity block of ``X``."""
     stride = metal_stride(num_worlds, max_dim * max_dim)
     wp.launch(zero_written_blocks, dim=(num_worlds, stride), inputs=[dim, mio, stride, extent, X], device=X.device)
+
+
+@wp.kernel
+def note_written_extent(dim: wp.array[wp.int32], extent: wp.array[wp.int32]):
+    """``extent[w] = max(extent[w], dim[w])``: a writer is about to write ``[0, dim[w]^2)``."""
+    wid = wp.tid()
+    d = dim[wid]
+    if d > extent[wid]:
+        extent[wid] = d
+
+
+def note_written(num_worlds: int, dim, extent) -> None:
+    """Metal: record that each world's block is about to be written at its current ``dim``.
+
+    Called by every Kamino writer of a block that :func:`zero_written` zeroes (Delassus build,
+    regularization, preconditioning, LLT factorization), so a later zeroing covers the write
+    even without a zeroing at that size in between.
+    """
+    wp.launch(note_written_extent, dim=num_worlds, inputs=[dim, extent], device=extent.device)

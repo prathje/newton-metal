@@ -703,16 +703,12 @@ class LLTBlockedSolver(DirectSolver[ScalarType, IndexType]):
             # zeroing the whole capacity, without its cost for many worlds).
             from ..dynamics import kernels_metal  # noqa: PLC0415
 
-            if getattr(self, "_metal_written_extent", None) is None:
-                self._metal_written_extent = wp.zeros(
-                    self._operator.info.num_blocks, dtype=wp.int32, device=self._device
-                )
             kernels_metal.zero_written(
                 self._operator.info.num_blocks,
                 self._operator.info.max_dimension,
                 self._operator.info.dim,
                 self._operator.info.mio,
-                self._metal_written_extent,
+                self._metal_extent(),
                 self._L,
             )
         else:
@@ -725,9 +721,19 @@ class LLTBlockedSolver(DirectSolver[ScalarType, IndexType]):
         # use the lane-parallel kernels there (see ``factorize.llt_lanes``).
         return self._dtype == wp.float32 and is_metal(self._device)
 
+    def _metal_extent(self) -> wp.array:
+        # Metal: per-block largest dimension any factorization wrote (see ``kernels_metal``).
+        if getattr(self, "_metal_written_extent", None) is None:
+            self._metal_written_extent = wp.zeros(self._operator.info.num_blocks, dtype=wp.int32, device=self._device)
+        return self._metal_written_extent
+
     def _lanes_factorize(self, dim: wp.array[IndexType], A: wp.array[ScalarType]) -> None:
         # Metal: one threadgroup per block (``llt_wide_metal``), or one SIMD group per block
-        # (``llt_lanes``) when NEWTON_KAMINO_METAL_WIDE_LLT=0.
+        # (``llt_lanes``) when NEWTON_KAMINO_METAL_WIDE_LLT=0. Record the written block sizes
+        # first so ``reset()`` covers this write even without a reset at this size.
+        from ..dynamics import kernels_metal  # noqa: PLC0415
+
+        kernels_metal.note_written(self._operator.info.num_blocks, dim, self._metal_extent())
         if llt_wide_metal.llt_wide_enabled():
             llt_wide_metal.llt_wide_factorize(
                 num_blocks=self._operator.info.num_blocks, dim=dim, mio=self._operator.info.mio, A=A, L=self._L
