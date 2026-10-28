@@ -645,6 +645,41 @@ class TestKaminoMetalLanes(unittest.TestCase):
         np.testing.assert_array_equal(test.problem.data.D.numpy(), D_strided)
         # (No CPU comparison: CPU emits the contacts in another order, so D's rows are permuted.)
 
+    def test_llt_reset_zeroes_everything_written(self):
+        """Metal zeroes only the written part of each block on reset; the buffer must still equal
+        a fully zeroed one, also after the active sizes shrink."""
+        dev = self.metal
+        maxdims = [40, 64]
+        info = DenseSquareMultiLinearInfo()
+        info.finalize(dimensions=maxdims, dtype=wp.float32, device=dev)
+        rng = np.random.default_rng(7)
+        mats = []
+        for n in maxdims:
+            X = rng.standard_normal((n, n))
+            mats.append((X @ X.T + n * np.eye(n)).astype(np.float32).ravel())
+        A = wp.array(np.concatenate(mats), dtype=wp.float32, device=dev)
+        llt = LLTBlockedSolver(operator=DenseLinearOperatorData(info=info, mat=A), device=dev)
+        mio = info.mio.numpy()
+        for dims in ([33, 64], [5, 20], [0, 7]):
+            info.dim.assign(dims)
+            # A holds full-capacity SPD blocks; with row stride ``dim`` the leading dim x dim
+            # entries are another SPD-looking block only by chance, so factor a fresh SPD block.
+            host = A.numpy()
+            for k, n in enumerate(dims):
+                if n:
+                    X = rng.standard_normal((n, n))
+                    host[mio[k] : mio[k] + n * n] = (X @ X.T + n * np.eye(n)).astype(np.float32).ravel()
+            A.assign(host)
+            llt.reset()
+            llt.compute(A=A)
+            L = llt.L.numpy()
+            for k, n in enumerate(dims):
+                block = L[mio[k] : mio[k] + maxdims[k] * maxdims[k]]
+                self.assertTrue(np.all(block[n * n :] == 0.0), f"dims={dims} block {k}")
+                if n:
+                    ref = np.linalg.cholesky(host[mio[k] : mio[k] + n * n].reshape(n, n).astype(np.float64))
+                    np.testing.assert_allclose(block[: n * n].reshape(n, n), ref, rtol=1e-4, atol=1e-5)
+
     def test_fused_division_is_ieee(self):
         """The solve's reciprocal + Newton-correction division rounds like IEEE division."""
         rng = np.random.default_rng(4)

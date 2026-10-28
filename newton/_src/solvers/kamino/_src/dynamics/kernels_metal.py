@@ -203,3 +203,37 @@ def build_delassus_tiled(
         (256, 1, 1),
         binding_modes=["r", "r", "r", "r", "r", "r", "r", "rw", None],
     )
+
+
+###
+# Zeroing only the written part of per-world dense blocks
+###
+
+
+@wp.kernel
+def zero_written_blocks(
+    dim: wp.array[wp.int32],
+    mio: wp.array[wp.int32],
+    stride: wp.int32,
+    extent: wp.array[wp.int32],
+    X: wp.array[wp.float32],
+):
+    """Zero ``X[mio[w] : mio[w] + e * e]`` with ``e = max(extent[w], dim[w])`` and record ``e``.
+
+    Every writer of a world's block writes inside ``[0, dim^2)`` (row stride ``dim``), so
+    ``extent`` (the largest ``dim`` since allocation) bounds everything ever written: the
+    result equals zeroing the whole capacity. All threads of a world store the same ``e``.
+    """
+    wid, lane = wp.tid()
+    e = wp.max(extent[wid], dim[wid])
+    m0 = mio[wid]
+    for k in range(lane, e * e, stride):
+        X[m0 + k] = 0.0
+    if lane == 0:
+        extent[wid] = e
+
+
+def zero_written(num_worlds: int, max_dim: int, dim, mio, extent, X) -> None:
+    """Metal: zero the written part of each world's dense ``max_dim``-capacity block of ``X``."""
+    stride = metal_stride(num_worlds, max_dim * max_dim)
+    wp.launch(zero_written_blocks, dim=(num_worlds, stride), inputs=[dim, mio, stride, extent, X], device=X.device)

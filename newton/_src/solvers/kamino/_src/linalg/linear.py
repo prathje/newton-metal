@@ -710,7 +710,25 @@ class LLTBlockedSolver(DirectSolver[ScalarType, IndexType]):
 
     @override
     def _reset_impl(self) -> None:
-        self._L.zero_()
+        if self._use_lanes() and self._operator.info.max_dimension > 0:
+            # Metal: zero only the part of each block any factorization wrote (same buffer as
+            # zeroing the whole capacity, without its cost for many worlds).
+            from ..dynamics import kernels_metal  # noqa: PLC0415
+
+            if getattr(self, "_metal_written_extent", None) is None:
+                self._metal_written_extent = wp.zeros(
+                    self._operator.info.num_blocks, dtype=wp.int32, device=self._device
+                )
+            kernels_metal.zero_written(
+                self._operator.info.num_blocks,
+                self._operator.info.max_dimension,
+                self._operator.info.dim,
+                self._operator.info.mio,
+                self._metal_written_extent,
+                self._L,
+            )
+        else:
+            self._L.zero_()
         self._y.zero_()
         self._has_factors = False
 

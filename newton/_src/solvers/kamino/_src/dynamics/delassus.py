@@ -1031,6 +1031,22 @@ class DelassusOperator:
         Sets all values of the Delassus matrix to zero.
         This is useful for resetting the operator before recomputing it.
         """
+        if is_metal(self._device) and self._world_maxdims:
+            # Metal: only the part any build wrote (zeroing the whole capacity costs ~10 ms per
+            # call with 128 anymal_d worlds); the resulting buffer is the same.
+            from . import kernels_metal  # noqa: PLC0415
+
+            if getattr(self, "_metal_written_extent", None) is None:
+                self._metal_written_extent = wp.zeros(self._num_worlds, dtype=wp.int32, device=self._device)
+            kernels_metal.zero_written(
+                self._num_worlds,
+                max(self._world_maxdims),
+                self._operator.info.dim,
+                self._operator.info.mio,
+                self._metal_written_extent,
+                self._operator.mat,
+            )
+            return
         self._operator.mat.zero_()
 
     def build(
