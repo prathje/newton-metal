@@ -1632,9 +1632,6 @@ def test_mesh_filter_preserves_overflow(test, device):
             capacity=1,
         )
         wp.synchronize()
-        if wp.get_device(device).is_metal:
-            # Metal kernels cannot print; the host prints the message at the next pass or poll.
-            contacts._soft_contact_mesh_data.metal_overflow.poll(synchronize=True)
     finally:
         output = capture.end()
     required = int(contacts._soft_contact_mesh_data.contact_count.numpy()[0])

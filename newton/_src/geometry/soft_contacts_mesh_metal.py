@@ -6,13 +6,20 @@
 On CPU and CUDA, ``_end_mesh_contacts`` in :mod:`soft_contacts_mesh` prints a
 ``wp.printf`` message when the full-surface mesh contacts exceed
 ``soft_contact_max``. Metal kernels cannot print, so on Metal the collision
-pass additionally launches :func:`_record_mesh_contact_overflow`, which keeps
-the largest required capacity in a small device array. The host reads it
-without forcing a sync (Metal arrays live in unified memory) at the start of
-the next mesh contact pass, from :meth:`MeshContactOverflowMonitor.poll`, or
-when the monitor is garbage-collected, and prints the CPU message line to
-stdout, once per new largest requirement. Unlike the printf, the report thus
-arrives one pass (or one poll) late.
+pass additionally launches :func:`_record_mesh_contact_overflow`, which stores
+the latest overflowing pass's requirement and counts overflowing passes in a
+small device array.
+
+The host prints the CPU message line on stdout at the next host sync point:
+Warp's Metal dispatcher calls back after every completed sync (``.numpy()``,
+``wp.synchronize*``, other host reads), after eager launches and graph replays
+alike, and once more when the interpreter exits, so an overflow in the last
+pass of a script is reported too. At that point every earlier launch has
+finished, so the read is exact. One line is printed per sync window that saw
+overflowing passes (CPU prints one per pass), with the requirement of the
+latest of them. A monitor that is garbage-collected stays registered until
+the next sync has reported what it recorded; nothing is printed from a
+finalizer.
 
 The truncated contact count itself (``soft_contact_max + 1``) is written on
 every device, so the overflow is never silent in the data.
@@ -34,25 +41,22 @@ from ..utils.device import is_capturing
 
 @wp.kernel(enable_backward=False)
 def _record_mesh_contact_overflow(source: wp.array[wp.int64], capacity: int, flags: wp.array[wp.int64]):
-    # flags = [largest required count seen, capacity at that time]
-    if source[0] > wp.int64(capacity) and source[0] > flags[0]:
+    # flags = [required count of the latest overflowing pass, its capacity, number of overflowing passes]
+    if source[0] > wp.int64(capacity):
         flags[0] = source[0]
         flags[1] = wp.int64(capacity)
+        flags[2] = flags[2] + wp.int64(1)
 
 
 def _peek(flags: wp.array) -> np.ndarray:
-    """Host copy of ``flags`` without waiting for in-flight GPU work."""
+    """Host copy of ``flags`` without issuing a sync (the caller has just synced)."""
     if not getattr(wp.config, "metal_native_dispatch", True):
         return flags.numpy()
     raw = (ctypes.c_int64 * flags.size).from_address(flags.ptr)
     return np.frombuffer(raw, dtype=np.int64, count=flags.size).copy()
 
 
-def _report(flags: wp.array, reported: list[int]) -> None:
-    required, capacity = (int(x) for x in _peek(flags))
-    if required <= reported[0]:
-        return
-    reported[0] = required
+def _print_overflow(required: int, capacity: int) -> None:
     # The exact line ``_end_mesh_contacts`` prints with wp.printf on CPU / CUDA, on stdout.
     print(  # noqa: T201 (stands in for the kernel printf)
         f"Mesh soft-contact capacity exceeded: soft_contact_max={capacity}, required={required}. "
@@ -62,10 +66,36 @@ def _report(flags: wp.array, reported: list[int]) -> None:
     )
 
 
-def _report_from_finalizer(flags: wp.array, reported: list[int]) -> None:
-    # A finalizer may run anywhere (inside a capture or a locked section): never sync.
-    if getattr(wp.config, "metal_native_dispatch", True):
-        _report(flags, reported)
+class _SyncReport:
+    """Dispatcher sync callback: print once if passes overflowed since the last report."""
+
+    def __init__(self, flags: wp.array):
+        self.flags = flags
+        self.passes_reported = 0
+        self.retired = False
+
+    def __call__(self) -> bool:
+        required, capacity, passes = (int(x) for x in _peek(self.flags))
+        if passes > self.passes_reported:
+            self.passes_reported = passes
+            _print_overflow(required, capacity)
+        # A retired (collected) monitor has now reported everything it recorded.
+        return not self.retired
+
+
+def _metal_dispatcher():
+    try:
+        from warp._src.metal_dispatch import get_dispatcher  # noqa: PLC0415
+
+        disp = get_dispatcher()
+    except Exception:
+        return None
+    return disp if hasattr(disp, "add_sync_callback") else None
+
+
+def _retire(report: _SyncReport) -> None:
+    # Finalizers may run anywhere (inside a capture, a locked section): only flag it.
+    report.retired = True
 
 
 class MeshContactOverflowMonitor:
@@ -73,25 +103,25 @@ class MeshContactOverflowMonitor:
 
     def __init__(self, device):
         self.device = wp.get_device(device)
-        self.flags = wp.zeros(2, dtype=wp.int64, device=self.device)
-        self._reported = [0]
-        self._finalizer = weakref.finalize(self, _report_from_finalizer, self.flags, self._reported)
+        self.flags = wp.zeros(3, dtype=wp.int64, device=self.device)
+        self._report = _SyncReport(self.flags)
+        disp = _metal_dispatcher()
+        if disp is None:
+            raise RuntimeError(
+                "Mesh soft-contact overflow reporting on Metal needs a Warp Metal dispatcher with "
+                "add_sync_callback(); this Warp build does not provide it."
+            )
+        disp.add_sync_callback(self._report)
+        weakref.finalize(self, _retire, self._report)
 
-    def poll(self, synchronize: bool = False) -> None:
-        """Print the overflow message if a larger overflow than the last reported one was recorded.
-
-        Does nothing while the device is capturing a graph. Without ``synchronize``
-        the read does not wait for in-flight GPU work.
-        """
-        if is_capturing(self.device):
-            return
-        if synchronize:
+    def poll(self) -> None:
+        """Synchronize the device, which prints the overflow message if passes overflowed
+        since the last report. Does nothing while capturing a graph."""
+        if not is_capturing(self.device):
             wp.synchronize_device(self.device)
-        _report(self.flags, self._reported)
 
     def launch(self, contact_count: wp.array, capacity: int) -> None:
-        """Report earlier overflows, then record this pass's required count."""
-        self.poll()
+        """Record this pass's required count if it exceeds ``capacity``."""
         wp.launch(
             _record_mesh_contact_overflow,
             dim=1,
