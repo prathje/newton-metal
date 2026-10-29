@@ -781,6 +781,64 @@ class TestKaminoMetalLanes(unittest.TestCase):
                 delassus.zero()
                 self.assertEqual(np.count_nonzero(delassus.D.numpy()), 0)
 
+    def test_jacobian_partial_zeroing_matches_full_zeroing(self):
+        """Metal zeroes only the constraint-Jacobian rows written since allocation: the built
+        Jacobians equal those of a full zeroing, also after builds at other row counts."""
+        from newton._src.solvers.kamino._src.dynamics import kernels_metal  # noqa: PLC0415
+
+        test = TestSetup(builder_fn=_padmm_mixed_worlds_builder, max_world_contacts=64, device=self.metal)
+        test.build()
+        jac = test.jacobians
+        self.assertIsNotNone(jac._metal_cts_extent)
+        J = jac.data.J_cts_data
+        nrows = test.data.info.num_total_cts.numpy().copy()
+        self.assertGreater(int(nrows.max()), 8)
+        # Garbage everywhere (as if every row had been written), then a build.
+        J.fill_(7.0)
+        with mock.patch.object(jac, "_metal_cts_extent", None):
+            jac.build(test.model, test.data, test.limits, test.contacts)
+        ref = J.numpy().copy()
+        # Garbage everywhere is covered by a record of every world's full row capacity.
+        offs = np.append(jac.data.J_cts_offsets.numpy(), J.size)
+        bo = test.model.info.bodies_offset.numpy()
+        cap_rows = [(offs[w + 1] - offs[w]) // (6 * (bo[w + 1] - bo[w])) for w in range(len(nrows))]
+        jac._metal_cts_extent.assign(np.array(cap_rows, dtype=np.int32))
+        J.fill_(7.0)
+        jac.build(test.model, test.data, test.limits, test.contacts)
+        np.testing.assert_array_equal(J.numpy(), ref)
+        # Rows written at larger row counts (with or without a zeroing) are zeroed later.
+        nw = len(nrows)
+        jac._metal_cts_extent.zero_()
+        big = wp.array(np.minimum(nrows + 5, nrows.max()).astype(np.int32), device=self.metal)
+        kernels_metal.zero_written_rows(
+            nw,
+            jac._max_J_cts_size,
+            big,
+            test.model.info.bodies_offset,
+            jac.data.J_cts_offsets,
+            jac._metal_cts_extent,
+            J,
+            zero=False,
+        )
+        J.fill_(3.0)  # stands for writes of up to `big` rows (and stale data beyond: none here)
+        J_np = J.numpy()
+        mask = np.zeros(J_np.size, bool)
+        for w in range(nw):
+            nbd = 6 * (bo[w + 1] - bo[w])
+            mask[offs[w] : offs[w] + int(big.numpy()[w]) * nbd] = True
+        J.assign(np.where(mask, J_np, 0.0).astype(np.float32))
+        small = wp.zeros(nw, dtype=wp.int32, device=self.metal)
+        kernels_metal.zero_written_rows(
+            nw,
+            jac._max_J_cts_size,
+            small,
+            test.model.info.bodies_offset,
+            jac.data.J_cts_offsets,
+            jac._metal_cts_extent,
+            J,
+        )
+        self.assertEqual(np.count_nonzero(J.numpy()), 0)
+
     def test_partial_zeroing_when_first_used_inside_a_graph_capture(self):
         """The examples capture the very first step. The written-extent record must not be
         allocated inside that capture: its zero fill would then be replayed every step and a

@@ -260,3 +260,41 @@ def note_written(num_worlds: int, dim, extent) -> None:
     even without a zeroing at that size in between.
     """
     wp.launch(note_written_extent, dim=num_worlds, inputs=[dim, extent], device=extent.device)
+
+
+@wp.kernel
+def zero_written_jacobian_rows(
+    num_rows: wp.array[wp.int32],
+    bodies_offset: wp.array[wp.int32],
+    J_off: wp.array[wp.int32],
+    stride: wp.int32,
+    zero: wp.int32,
+    extent: wp.array[wp.int32],
+    J: wp.array[wp.float32],
+):
+    """Zero rows ``[0, e)`` of each world's constraint Jacobian block (``6 * num_bodies`` columns,
+    at ``J_off[w]``) with ``e = max(extent[w], num_rows[w])``, and record ``e`` (only record it
+    when ``zero`` is 0). As :func:`zero_written_blocks`: ``e`` bounds every row written since
+    allocation, so the result equals zeroing the whole block."""
+    wid, lane = wp.tid()
+    e = wp.max(extent[wid], num_rows[wid])
+    if zero != 0:
+        nbd = 6 * (bodies_offset[wid + 1] - bodies_offset[wid])
+        m0 = J_off[wid]
+        for k in range(lane, e * nbd, stride):
+            J[m0 + k] = 0.0
+    if lane == 0:
+        extent[wid] = e
+
+
+def zero_written_rows(num_worlds: int, max_block: int, num_rows, bodies_offset, J_off, extent, J, zero: bool = True):
+    """Metal: zero the rows of each world's dense constraint Jacobian block written since
+    allocation, after recording the current row counts (``zero=False``: only record them, for a
+    build that accumulates onto the existing values)."""
+    stride = metal_stride(num_worlds, max_block) if zero else 32
+    wp.launch(
+        zero_written_jacobian_rows,
+        dim=(num_worlds, stride),
+        inputs=[num_rows, bodies_offset, J_off, stride, int(zero), extent, J],
+        device=J.device,
+    )
