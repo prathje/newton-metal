@@ -12,6 +12,7 @@ from typing import Any
 import numpy as np
 import warp as wp
 
+from .....utils.device import is_metal
 from ..core.data import DataKamino
 from ..core.joints import JointDoFType
 from ..core.math import (
@@ -1475,6 +1476,11 @@ class DenseSystemJacobians:
         # Declare and initialize the Jacobian data container
         self._data = DenseSystemJacobiansData()
 
+        # Metal: per-world largest number of constraint rows written since allocation and the
+        # largest per-world block of ``J_cts_data`` (see ``build``).
+        self._metal_cts_extent: wp.array[wp.int32] | None = None
+        self._max_J_cts_size: int = 0
+
         # If a model is provided, allocate the Jacobians data
         if model is not None:
             self.finalize(model=model, limits=limits, contacts=contacts)
@@ -1544,6 +1550,12 @@ class DenseSystemJacobians:
             self._data.J_cts_data = wp.zeros(shape=(total_J_cts_size,), dtype=wp.float32)
             self._data.J_dofs_data = wp.zeros(shape=(total_J_dofs_size,), dtype=wp.float32)
 
+        # Metal: allocated here, outside any graph capture (see ``build``).
+        self._metal_cts_extent = None
+        self._max_J_cts_size = max(J_cts_sizes, default=0)
+        if is_metal(device):
+            self._metal_cts_extent = wp.zeros(nw, dtype=wp.int32, device=device)
+
     def build(
         self,
         model: ModelKamino,
@@ -1570,7 +1582,31 @@ class DenseSystemJacobians:
                 Defaults to `True`.
         """
         # Optionally reset the Jacobian array data to zero
-        if reset_to_zero:
+        if self._metal_cts_extent is not None and data.info.num_total_cts is not None:
+            # Metal: the constraint Jacobian rows of a world are written below its number of active
+            # constraints, so only the rows any build wrote since allocation are zeroed (the whole
+            # capacity is ~5 ms per frame with 128 anymal_d worlds); the resulting buffer is the same.
+            from ..dynamics import kernels_metal  # noqa: PLC0415
+
+            kernels_metal.zero_written_rows(
+                model.info.num_worlds,
+                self._max_J_cts_size,
+                data.info.num_total_cts,
+                model.info.bodies_offset,
+                self._data.J_cts_offsets,
+                self._metal_cts_extent,
+                self._data.J_cts_data,
+                zero=reset_to_zero,
+                limits=(limits.world_active_limits, data.info.limit_cts_group_offset)
+                if limits is not None and limits.model_max_limits_host > 0
+                else None,
+                contacts=(contacts.world_active_contacts, data.info.contact_cts_group_offset)
+                if contacts is not None and contacts.model_max_contacts_host > 0
+                else None,
+            )
+            if reset_to_zero:
+                self._data.J_dofs_data.zero_()
+        elif reset_to_zero:
             self._data.J_cts_data.zero_()
             self._data.J_dofs_data.zero_()
 

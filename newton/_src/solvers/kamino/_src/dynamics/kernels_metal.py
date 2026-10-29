@@ -260,3 +260,92 @@ def note_written(num_worlds: int, dim, extent) -> None:
     even without a zeroing at that size in between.
     """
     wp.launch(note_written_extent, dim=num_worlds, inputs=[dim, extent], device=extent.device)
+
+
+@wp.kernel
+def zero_written_jacobian_rows(
+    num_rows: wp.array[wp.int32],
+    bodies_offset: wp.array[wp.int32],
+    J_off: wp.array[wp.int32],
+    J_size: wp.int32,
+    stride: wp.int32,
+    zero: wp.int32,
+    has_limits: wp.int32,
+    has_contacts: wp.int32,
+    num_limits: wp.array[wp.int32],
+    limit_offset: wp.array[wp.int32],
+    num_contacts: wp.array[wp.int32],
+    contact_offset: wp.array[wp.int32],
+    extent: wp.array[wp.int32],
+    J: wp.array[wp.float32],
+):
+    """Zero rows ``[0, e)`` of each world's constraint Jacobian block (``6 * num_bodies`` columns,
+    at ``J_off[w]``) with ``e = max(extent[w], num_rows[w])``, and record ``e`` (only record it
+    when ``zero`` is 0). As :func:`zero_written_blocks`: ``e`` bounds every row written since
+    allocation, so the result equals zeroing the whole block.
+
+    The rows the limit / contact builds write are also bounded by the group offsets and active
+    counts they read (``limit_offset[w] + num_limits[w]``, ``contact_offset[w] + 3 *
+    num_contacts[w]``, when ``has_limits`` / ``has_contacts``), so ``e`` stays an upper
+    bound when ``num_rows`` was not updated after a new detection. ``e`` is capped at the
+    world's row capacity."""
+    wid, lane = wp.tid()
+    e = wp.max(extent[wid], num_rows[wid])
+    if has_limits != 0:
+        e = wp.max(e, limit_offset[wid] + num_limits[wid])
+    if has_contacts != 0:
+        e = wp.max(e, contact_offset[wid] + 3 * num_contacts[wid])
+    nbd = 6 * (bodies_offset[wid + 1] - bodies_offset[wid])
+    m0 = J_off[wid]
+    m1 = J_size
+    if wid + 1 < J_off.shape[0]:
+        m1 = J_off[wid + 1]
+    if nbd > 0:
+        e = wp.min(e, (m1 - m0) / nbd)
+    if zero != 0:
+        for k in range(lane, e * nbd, stride):
+            J[m0 + k] = 0.0
+    if lane == 0:
+        extent[wid] = e
+
+
+def zero_written_rows(
+    num_worlds: int,
+    max_block: int,
+    num_rows,
+    bodies_offset,
+    J_off,
+    extent,
+    J,
+    zero: bool = True,
+    limits: tuple | None = None,
+    contacts: tuple | None = None,
+):
+    """Metal: zero the rows of each world's dense constraint Jacobian block written since
+    allocation, after recording the current row counts (``zero=False``: only record them, for a
+    build that accumulates onto the existing values). ``limits`` / ``contacts``: ``(active
+    count per world, group offset per world)`` of the limit / contact Jacobian builds that follow."""
+    stride = metal_stride(num_worlds, max_block) if zero else 32
+    nl, lo = limits if limits is not None else (num_rows, num_rows)
+    nc, co = contacts if contacts is not None else (num_rows, num_rows)
+    wp.launch(
+        zero_written_jacobian_rows,
+        dim=(num_worlds, stride),
+        inputs=[
+            num_rows,
+            bodies_offset,
+            J_off,
+            J.shape[0],
+            stride,
+            int(zero),
+            int(limits is not None),
+            int(contacts is not None),
+            nl,
+            lo,
+            nc,
+            co,
+            extent,
+            J,
+        ],
+        device=J.device,
+    )

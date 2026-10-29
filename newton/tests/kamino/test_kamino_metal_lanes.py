@@ -559,6 +559,37 @@ class TestKaminoMetalLanes(unittest.TestCase):
             self.assertFalse(metal_fused.fused_padmm_supported(solver, test.problem))
         self.assertTrue(metal_fused.fused_padmm_supported(solver, test.problem))
 
+    def test_fused_padmm_device_memory_solve_vector_is_bitwise(self):
+        """Worlds with more constraints than the threadgroup solve vector holds run the fused loop on
+        device memory: same arithmetic, bit-identical to the threadgroup path (captured and eager)."""
+        for captured in (False, True):
+            with self.subTest(captured=captured):
+                st_t, lam_t, ncts, *_ = _padmm_solve(
+                    self.metal, fused=True, builder_fn=_padmm_mixed_worlds_builder, captured=captured
+                )
+                self.assertGreater(ncts, 32)
+                # 32: the large world runs on device memory, the small ones in threadgroup memory.
+                with mock.patch.object(metal_fused, "_XCAP_LIMIT", 32):
+                    st_d, lam_d, *_ = _padmm_solve(
+                        self.metal, fused=True, builder_fn=_padmm_mixed_worlds_builder, captured=captured
+                    )
+                np.testing.assert_array_equal(lam_d, lam_t)
+                np.testing.assert_array_equal(st_d, st_t)
+
+    def test_fused_padmm_capacity_beyond_threadgroup_memory(self):
+        """A constraint capacity whose solve vector does not fit threadgroup memory (r10 fell back to
+        the per-kernel loop, e.g. dr_testmech: 12065 rows, 59 used) still runs the fused loop."""
+        test = TestSetup(builder_fn=_padmm_builder, max_world_contacts=4096, device=self.metal)
+        solver = PADMMSolver(
+            model=test.model, config=PADMMSolver.Config(), warmstart=PADMMWarmStartMode.NONE, use_acceleration=True
+        )
+        test.build()
+        ncap = metal_fused._ncap(solver._size.max_of_max_total_cts)
+        tg = metal_fused._tg_for(solver._size.num_worlds, metal_fused.FUSED_TG_SIZE)
+        self.assertGreater(metal_fused._tg_bytes(tg, ncap), metal_fused._max_tg_memory())
+        self.assertLess(metal_fused._xcap(tg, ncap), ncap)
+        self.assertTrue(metal_fused.fused_padmm_supported(solver, test.problem))
+
     def test_wide_llt_solve_matches_reference(self):
         """The threadgroup-wide triangular solves of the fused loop against float64 numpy."""
         rng = np.random.default_rng(3)
@@ -584,6 +615,11 @@ class TestKaminoMetalLanes(unittest.TestCase):
             x = wp.zeros(v, dtype=wp.float32, device=dev)
             metal_fused.launch_wide_llt_solve(len(dims), max(dims), dim, mio_w, vio_w, L, b, x, tg=tg)
             xs = x.numpy()
+            # Blocks larger than the threadgroup solve vector solve on device memory, bit-identically.
+            with mock.patch.object(metal_fused, "_XCAP_LIMIT", 64):
+                x_dev = wp.zeros(v, dtype=wp.float32, device=dev)
+                metal_fused.launch_wide_llt_solve(len(dims), max(dims), dim, mio_w, vio_w, L, b, x_dev, tg=tg)
+            np.testing.assert_array_equal(x_dev.numpy(), xs, err_msg=f"tg={tg}")
             for k, n in enumerate(dims):
                 if n == 0:
                     continue
@@ -744,6 +780,95 @@ class TestKaminoMetalLanes(unittest.TestCase):
                 delassus.info.dim.assign(np.full(nw, 2, np.int32))
                 delassus.zero()
                 self.assertEqual(np.count_nonzero(delassus.D.numpy()), 0)
+
+    def test_jacobian_partial_zeroing_matches_full_zeroing(self):
+        """Metal zeroes only the constraint-Jacobian rows written since allocation: the built
+        Jacobians equal those of a full zeroing, also after builds at other row counts."""
+        from newton._src.solvers.kamino._src.dynamics import kernels_metal  # noqa: PLC0415
+
+        test = TestSetup(builder_fn=_padmm_mixed_worlds_builder, max_world_contacts=64, device=self.metal)
+        test.build()
+        jac = test.jacobians
+        self.assertIsNotNone(jac._metal_cts_extent)
+        J = jac.data.J_cts_data
+        nrows = test.data.info.num_total_cts.numpy().copy()
+        self.assertGreater(int(nrows.max()), 8)
+        # Garbage everywhere (as if every row had been written), then a build.
+        J.fill_(7.0)
+        with mock.patch.object(jac, "_metal_cts_extent", None):
+            jac.build(test.model, test.data, test.limits, test.contacts)
+        ref = J.numpy().copy()
+        # Garbage everywhere is covered by a record of every world's full row capacity.
+        offs = np.append(jac.data.J_cts_offsets.numpy(), J.size)
+        bo = test.model.info.bodies_offset.numpy()
+        cap_rows = [(offs[w + 1] - offs[w]) // (6 * (bo[w + 1] - bo[w])) for w in range(len(nrows))]
+        jac._metal_cts_extent.assign(np.array(cap_rows, dtype=np.int32))
+        J.fill_(7.0)
+        jac.build(test.model, test.data, test.limits, test.contacts)
+        np.testing.assert_array_equal(J.numpy(), ref)
+        # Rows written at larger row counts (with or without a zeroing) are zeroed later.
+        nw = len(nrows)
+        jac._metal_cts_extent.zero_()
+        big = wp.array(np.minimum(nrows + 5, nrows.max()).astype(np.int32), device=self.metal)
+        kernels_metal.zero_written_rows(
+            nw,
+            jac._max_J_cts_size,
+            big,
+            test.model.info.bodies_offset,
+            jac.data.J_cts_offsets,
+            jac._metal_cts_extent,
+            J,
+            zero=False,
+        )
+        J.fill_(3.0)  # stands for writes of up to `big` rows (and stale data beyond: none here)
+        J_np = J.numpy()
+        mask = np.zeros(J_np.size, bool)
+        for w in range(nw):
+            nbd = 6 * (bo[w + 1] - bo[w])
+            mask[offs[w] : offs[w] + int(big.numpy()[w]) * nbd] = True
+        J.assign(np.where(mask, J_np, 0.0).astype(np.float32))
+        small = wp.zeros(nw, dtype=wp.int32, device=self.metal)
+        kernels_metal.zero_written_rows(
+            nw,
+            jac._max_J_cts_size,
+            small,
+            test.model.info.bodies_offset,
+            jac.data.J_cts_offsets,
+            jac._metal_cts_extent,
+            J,
+        )
+        self.assertEqual(np.count_nonzero(J.numpy()), 0)
+
+    def test_jacobian_partial_zeroing_with_stale_row_counts(self):
+        """The written-row record also covers rows a build writes beyond ``num_total_cts`` (a new
+        detection without ``update_constraints_info``): a later build at fewer rows still equals
+        a build with full zeroing."""
+        from newton._src.solvers.kamino._src.kinematics.constraints import (  # noqa: PLC0415
+            update_constraints_info,
+        )
+
+        test = TestSetup(builder_fn=_padmm_mixed_worlds_builder, max_world_contacts=64, device=self.metal)
+        jac = test.jacobians
+        self.assertIsNotNone(jac._metal_cts_extent)
+        model, data, limits, contacts = test.model, test.data, test.limits, test.contacts
+        self.assertGreater(int(contacts.world_active_contacts.numpy().max()), 0)
+        nrows = data.info.num_total_cts.numpy().copy()
+        joint_rows = model.info.num_joint_bilateral_cts.numpy() + model.info.num_joint_bounded_cts.numpy()
+        self.assertTrue(np.any(joint_rows < nrows))
+        # A build whose row counts lag the detection (joint rows only): contact rows are written beyond.
+        jac._metal_cts_extent.zero_()
+        data.info.num_total_cts.assign(joint_rows.astype(np.int32))
+        jac.build(model, data, limits, contacts)
+        data.info.num_total_cts.assign(nrows)
+        # The next detection finds no contacts (row counts refreshed), then a build.
+        contacts.world_active_contacts.zero_()
+        contacts.model_active_contacts.zero_()
+        update_constraints_info(model=model, data=data)
+        jac.build(model, data, limits, contacts)
+        got = jac.data.J_cts_data.numpy().copy()
+        with mock.patch.object(jac, "_metal_cts_extent", None):
+            jac.build(model, data, limits, contacts)
+        np.testing.assert_array_equal(got, jac.data.J_cts_data.numpy())
 
     def test_partial_zeroing_when_first_used_inside_a_graph_capture(self):
         """The examples capture the very first step. The written-extent record must not be
@@ -929,6 +1054,69 @@ class TestKaminoMetalLanes(unittest.TestCase):
             for a, b in zip(metal[1:], cpu[1:], strict=True):
                 self.assertGreater(np.abs(b).max(), 0.01)
                 np.testing.assert_array_equal(a, b, err_msg=f"capacity_stride={capacity_stride}")
+
+    def test_rcm_symbolic_fill_in_matches_cpu(self):
+        """Threadgroup-parallel symbolic fill-in (Metal) gives the CPU kernel's tile pattern, for
+        patterns with up to 64 tiles (CPU bitset path) and beyond (CPU column scans)."""
+        from newton._src.solvers.kamino._src.linalg.factorize import (  # noqa: PLC0415
+            llt_blocked_rcm,
+            llt_blocked_rcm_metal,
+        )
+
+        rng = np.random.default_rng(9)
+        bs = 32
+        dims = [1, 31, 33, 640, 2048, 3553, 4700, 0, 1000]
+        max_n_tiles = max((d + bs - 1) // bs for d in dims)
+        tiles = [(d + bs - 1) // bs for d in dims]
+        tpo = np.concatenate([[0], np.cumsum([t * t for t in tiles])[:-1]]).astype(np.int32)
+        pattern = np.zeros(sum(t * t for t in tiles), dtype=np.int32)
+        for k, t in enumerate(tiles):
+            block = (rng.random((t, t)) < (0.03 if t > 20 else 0.3)).astype(np.int32)
+            pattern[tpo[k] : tpo[k] + t * t] = block.ravel()
+        results = {}
+        for device in ("cpu", self.metal):
+            dim = wp.array(np.array(dims, dtype=np.int32), device=device)
+            tpo_w = wp.array(tpo, device=device)
+            tp = wp.array(pattern, device=device)
+            if device == "cpu":
+                kernel = llt_blocked_rcm.make_llt_blocked_rcm_symbolic_fill_in_kernel(max_n_tiles)
+                llt_blocked_rcm.llt_blocked_rcm_symbolic_fill_in(kernel, dim, tpo_w, bs, tp, len(dims), device)
+            else:
+                masks = wp.zeros(
+                    len(dims) * llt_blocked_rcm_metal.symbolic_fill_in_words(max_n_tiles),
+                    dtype=wp.uint32,
+                    device=device,
+                )
+                kernel = llt_blocked_rcm_metal.symbolic_fill_in_kernel(max_n_tiles)
+                for _ in range(2):  # stale bitsets from a previous call must not leak
+                    tp.assign(pattern)
+                    llt_blocked_rcm_metal.launch_symbolic_fill_in(kernel, dim, tpo_w, bs, tp, masks, len(dims), device)
+            results[str(device)] = tp.numpy()
+        self.assertGreater(int(results["cpu"].sum()), int(pattern.sum()), "the patterns must fill in")
+        np.testing.assert_array_equal(results[str(self.metal)], results["cpu"])
+
+    def test_rcm_symbolic_fill_in_other_block_width_is_conservative(self):
+        """Launched at a block width other than its own, the symbolic fill-in kernel marks the whole
+        lower triangle (a superset of the fill-in) instead of leaving the pattern unfilled."""
+        from newton._src.solvers.kamino._src.linalg.factorize import llt_blocked_rcm_metal  # noqa: PLC0415
+
+        bs, n = 32, 40 * 32
+        t = n // bs
+        rng = np.random.default_rng(5)
+        block = np.zeros((t, t), dtype=np.int32)  # no fill-in at all: only the diagonal is set
+        block[np.triu_indices(t, 1)] = rng.integers(0, 3, t * (t - 1) // 2)
+        dev = self.metal
+        dim = wp.array(np.array([n], dtype=np.int32), device=dev)
+        tpo = wp.array(np.zeros(1, dtype=np.int32), device=dev)
+        tp = wp.array(block.ravel(), device=dev)
+        masks = wp.zeros(llt_blocked_rcm_metal.symbolic_fill_in_words(t), dtype=wp.uint32, device=dev)
+        # A fresh kernel object (block model fixed at its first launch), launched 64 wide.
+        kernel = llt_blocked_rcm_metal._make_symbolic_fill_in_kernel(t, 128)
+        llt_blocked_rcm_metal.launch_symbolic_fill_in(kernel, dim, tpo, bs, tp, masks, 1, dev, width=64)
+        got = tp.numpy().reshape(t, t)
+        want = block.copy()
+        want[np.tril_indices(t)] = np.maximum(want[np.tril_indices(t)], 1)
+        np.testing.assert_array_equal(got, want)
 
     def test_sparse_pgs_wide_block_matches_one_lane(self):
         # One lane first: a kernel object keeps the block model it gets at 256 threads.

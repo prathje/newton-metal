@@ -26,7 +26,9 @@ single hand-written Metal kernel:
   rewritten with the values they already hold);
 * the triangular solves use the whole threadgroup: panel dot products are spread
   over all SIMD groups (``simd_sum``), each panel's 32x32 triangle is solved by one
-  SIMD group with shuffles, and the solution vector lives in threadgroup memory.
+  SIMD group with shuffles, and the solution vector lives in threadgroup memory (or,
+  for a world with more constraints than fit there, on its block of the state vector
+  ``x`` in device memory: same arithmetic, see ``_xcap``).
 
 The only differences to the per-kernel path are summation orders (the triangular
 solve's dot products and the residual sums ``r_dx``, ``r_dy``, ``r_dz``), i.e. float
@@ -151,7 +153,7 @@ _ARG_PTRS = (
 _ARG_FMT = "<" + "Q" * len(_ARG_PTRS) + "II"
 
 
-def _msl_source(tg: int, ncap: int) -> str:
+def _msl_source(tg: int, ncap: int, xcap: int) -> str:
     ptr_decl = "\n".join(f"    ulong {p};" for p in _ARG_PTRS)
     return (
         """
@@ -166,6 +168,7 @@ using namespace metal;
 #define TG {tg}
 #define NSG (TG / 32)
 #define NCAP {ncap}
+#define XCAP {xcap}
 #define PENALTY_BALANCED {int(PADMMPenaltyUpdate.BALANCED)}
 #define FLOAT32_EPS {float(np.finfo(np.float32).eps)!r}f
 
@@ -222,7 +225,20 @@ static void stage_bwd(device const float* Lm, int n, int q, threadgroup float* L
     }
 }
 
-// Solve L L^T x = b in place on the threadgroup vector X[0, n) (X holds b on entry).
+// Threadgroup barrier that also orders the solve vector X: X lives in threadgroup memory
+// when the world's constraint count fits (n <= XCAP), else in device memory.
+static inline void xbarrier(threadgroup float*)
+{
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+static inline void xbarrier(device float*)
+{
+    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+}
+
+// Solve L L^T x = b in place on the vector X[0, n) (X holds b on entry; threadgroup
+// memory, or device memory for worlds with more than XCAP constraints).
 // L is the row-major n x n Cholesky factor at Lm (lower triangle). LB is threadgroup
 // scratch of 2 * LBS floats, SP of 2 * TG floats. Needs TG >= 64.
 //
@@ -235,7 +251,8 @@ static void stage_bwd(device const float* Lm, int n, int q, threadgroup float* L
 //   later row with the previous panel; backward, the next panel's partial dot products
 //   with the rows already solved (left-looking, one partial per SIMD group in SP).
 // Every entry is a sum of the same products as plain substitution, in another order.
-static void llt_solve_tg(device const float* Lm, int n, threadgroup float* X,
+template <typename XPtr>
+static void llt_solve_tg(device const float* Lm, int n, XPtr X,
                          threadgroup float* LB, threadgroup float* SP, uint t, uint lane, uint sg)
 {
     const int npanels = (n + 31) / 32;
@@ -250,7 +267,7 @@ static void llt_solve_tg(device const float* Lm, int n, threadgroup float* X,
     if (sg != 0) {
         stage_fwd(Lm, n, 0, LB, tid_o, nthr_o);
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    xbarrier(X);
     float carry = 0.0f;  // SIMD group 0: L[row of panel q, panel q-1] . w[panel q-1]
     for (int q = 0; q < npanels; ++q) {
         const int p0 = q * 32;
@@ -331,7 +348,7 @@ static void llt_solve_tg(device const float* Lm, int n, threadgroup float* X,
             }
             carry = cn;
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        xbarrier(X);
     }
 
     // ---- Backward substitution: L^T x = w
@@ -352,7 +369,7 @@ static void llt_solve_tg(device const float* Lm, int n, threadgroup float* X,
             SP[TG + g * 32 + r] = 0.0f;
         }
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    xbarrier(X);
     for (int q = npanels - 1, it = 0; q >= 0; --q, ++it) {
         const int p0 = q * 32;
         const int rows = min(32, n - p0);
@@ -412,7 +429,7 @@ static void llt_solve_tg(device const float* Lm, int n, threadgroup float* X,
             }
             carry = cn;
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        xbarrier(X);
     }
 }
 
@@ -423,7 +440,7 @@ kernel void kamino_llt_solve_wide(constant KArgs& A [[buffer(0)]],
                                   uint lane [[thread_index_in_simdgroup]],
                                   uint sg [[simdgroup_index_in_threadgroup]])
 {
-    threadgroup float X[NCAP];
+    threadgroup float X[XCAP];
     threadgroup float LB[2 * LBS];
     threadgroup float SP[2 * TG];
     const int n = DPTR(int, dim)[w];
@@ -433,13 +450,23 @@ kernel void kamino_llt_solve_wide(constant KArgs& A [[buffer(0)]],
     const int m0 = DPTR(int, mio)[w];
     const int v0 = DPTR(int, vio)[w];
     // b is passed in "v", x in "x".
-    for (int i = int(t); i < n; i += TG) {
-        X[i] = DPTR(float, v)[v0 + i];
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    llt_solve_tg(DPTR(float, L) + m0, n, X, LB, SP, t, lane, sg);
-    for (int i = int(t); i < n; i += TG) {
-        DPTR(float, x)[v0 + i] = X[i];
+    if (n <= XCAP) {
+        for (int i = int(t); i < n; i += TG) {
+            X[i] = DPTR(float, v)[v0 + i];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        llt_solve_tg(DPTR(float, L) + m0, n, &X[0], LB, SP, t, lane, sg);
+        for (int i = int(t); i < n; i += TG) {
+            DPTR(float, x)[v0 + i] = X[i];
+        }
+    } else {
+        // Solve in place on x in device memory.
+        device float* Xd = DPTR(float, x) + v0;
+        for (int i = int(t); i < n; i += TG) {
+            Xd[i] = DPTR(float, v)[v0 + i];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+        llt_solve_tg(DPTR(float, L) + m0, n, Xd, LB, SP, t, lane, sg);
     }
 }
 
@@ -494,21 +521,15 @@ static float3 project_to_coulomb_cone(float3 x, float mu)
 #define CTRL_FROZEN 4
 
 // The accelerated PADMM loop (``PADMMSolver._step_accel`` repeated until the world
-// converged or exhausted ``max_iterations``), one threadgroup per world.
-kernel void kamino_padmm_accel_dense(constant KArgs& A [[buffer(0)]],
-                                     uint w [[threadgroup_position_in_grid]],
-                                     uint t [[thread_index_in_threadgroup]],
-                                     uint lane [[thread_index_in_simdgroup]],
-                                     uint sg [[simdgroup_index_in_threadgroup]])
+// converged or exhausted ``max_iterations``) of world w on the solve vector X: the
+// threadgroup array, or the world's block of the state vector x in device memory when the
+// world has more than XCAP constraints (x is the solve's output, and each iteration
+// overwrites it with the solution anyway).
+template <typename XPtr>
+static void padmm_world(constant KArgs& A, uint w, uint t, uint lane, uint sg, XPtr X,
+                        threadgroup float* LB, threadgroup float* SP, threadgroup float* RED,
+                        threadgroup int& ctrl_sh, threadgroup float& a_factor_sh, threadgroup float& rho_sh)
 {
-    threadgroup float X[NCAP];
-    threadgroup float LB[2 * LBS];
-    threadgroup float SP[2 * TG];
-    threadgroup float RED[6 * NSG];
-    threadgroup int ctrl_sh;
-    threadgroup float a_factor_sh;
-    threadgroup float rho_sh;
-
     const int ncts = DPTR(int, dim)[w];
     const int vio = DPTR(int, vio)[w];
     const int m0 = DPTR(int, mio)[w];
@@ -573,7 +594,7 @@ kernel void kamino_padmm_accel_dense(constant KArgs& A [[buffer(0)]],
             sv[k] = vi;
             X[i] = vi;
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        xbarrier(X);
 
         // --- Unconstrained solution: D x = v
         llt_solve_tg(Lm, ncts, X, LB, SP, t, lane, sg);
@@ -779,6 +800,27 @@ kernel void kamino_padmm_accel_dense(constant KArgs& A [[buffer(0)]],
         }
     }
 }
+
+kernel void kamino_padmm_accel_dense(constant KArgs& A [[buffer(0)]],
+                                     uint w [[threadgroup_position_in_grid]],
+                                     uint t [[thread_index_in_threadgroup]],
+                                     uint lane [[thread_index_in_simdgroup]],
+                                     uint sg [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float X[XCAP];
+    threadgroup float LB[2 * LBS];
+    threadgroup float SP[2 * TG];
+    threadgroup float RED[6 * NSG];
+    threadgroup int ctrl_sh;
+    threadgroup float a_factor_sh;
+    threadgroup float rho_sh;
+    if (DPTR(int, dim)[w] <= XCAP) {
+        padmm_world(A, w, t, lane, sg, &X[0], LB, SP, RED, ctrl_sh, a_factor_sh, rho_sh);
+    } else {
+        padmm_world(A, w, t, lane, sg, DPTR(float, x) + DPTR(int, vio)[w], LB, SP, RED, ctrl_sh, a_factor_sh,
+                    rho_sh);
+    }
+}
 """
     )
 
@@ -793,16 +835,32 @@ _PSO_CACHE: dict = {}
 def _pso(entry: str, tg: int, ncap: int):
     from warp._src.metal_dispatch import get_dispatcher  # noqa: PLC0415
 
-    key = (entry, tg, ncap)
+    xcap = _xcap(tg, ncap)
+    key = (entry, tg, ncap, xcap)
     pso = _PSO_CACHE.get(key)
     if pso is None:
-        pso = get_dispatcher().compile(_msl_source(tg, ncap), entry)
+        pso = get_dispatcher().compile(_msl_source(tg, ncap, xcap), entry)
         _PSO_CACHE[key] = pso
     return pso
 
 
 def _ncap(max_dim: int) -> int:
     return max(32, ((int(max_dim) + 31) // 32) * 32)
+
+
+_XCAP_LIMIT: int | None = None
+"""Tests only: cap on the threadgroup solve vector (worlds with more constraints use device memory)."""
+
+
+def _xcap(tg: int, ncap: int) -> int:
+    """Length of the threadgroup solve vector ``X``: the capacity ``ncap`` when it fits next to the
+    kernel's other threadgroup arrays, else what fits (a multiple of 32). Worlds with more
+    constraints than this solve on their block of the state vector ``x`` in device memory."""
+    fit = (_max_tg_memory() - _tg_bytes(tg, 0) - 64) // 4 // 32 * 32
+    xcap = min(ncap, fit)
+    if _XCAP_LIMIT is not None:
+        xcap = min(xcap, _XCAP_LIMIT)
+    return max(xcap, 0)
 
 
 def _buffer(arr: wp.array):
@@ -857,8 +915,8 @@ def fused_padmm_supported(solver, problem) -> bool:
 
     Requires the accelerated dense path with the Metal lane-parallel Cholesky factor,
     no per-iteration info collection, the same ``max_iterations >= 1`` in every world
-    (see the module docstring), and a constraint count whose solve vector fits in
-    threadgroup memory.
+    (see the module docstring), and threadgroup memory for at least a 32-entry solve vector
+    (worlds with more constraints than fit solve on device memory, see :func:`_xcap`).
     """
     if not fused_padmm_enabled():
         return False
@@ -879,19 +937,19 @@ def fused_padmm_supported(solver, problem) -> bool:
     methods = {PADMMPenaltyUpdate.from_string(c.penalty_update_method) for c in solver._config}
     if not methods <= {PADMMPenaltyUpdate.FIXED, PADMMPenaltyUpdate.BALANCED}:
         return False
-    # The solve vector of every world must fit the threadgroup array sized from the solver's capacity.
+    # Every world's constraint count must be within the solver's capacity.
     ncap = _ncap(solver._size.max_of_max_total_cts)
     if max(getattr(delassus, "_world_maxdims", None) or [0]) > ncap:
         return False
     tg = _tg_for(solver._size.num_worlds, FUSED_TG_SIZE)
-    if _tg_bytes(tg, ncap) > _max_tg_memory():
+    if _xcap(tg, ncap) < 32:
         return False
     return int(_pso("kamino_padmm_accel_dense", tg, ncap).maxTotalThreadsPerThreadgroup()) >= tg
 
 
-def _tg_bytes(tg: int, ncap: int) -> int:
+def _tg_bytes(tg: int, xcap: int) -> int:
     """Static threadgroup memory of :func:`kamino_padmm_accel_dense` (floats/ints of 4 bytes)."""
-    return 4 * (ncap + 2 * _LBS + 2 * tg + 6 * (tg // 32) + 3)
+    return 4 * (xcap + 2 * _LBS + 2 * tg + 6 * (tg // 32) + 3)
 
 
 def _max_tg_memory() -> int:
