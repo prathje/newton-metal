@@ -399,6 +399,14 @@ def _make_symbolic_fill_in_kernel(max_n_tiles: int, width: int):
                 return
             nthreads = int32(1)
         elif block != int32(width):
+            # Any other block model would split the column steps: mark the whole lower triangle
+            # (a superset of the fill-in, so the factorization stays exact, only slower).
+            if lane == int32(0):
+                n_all = (dim[b] + block_size - int32(1)) / block_size
+                for i in range(n_all):
+                    for j in range(i + int32(1)):
+                        if tile_pattern[tpo[b] + i * n_all + j] == int32(0):
+                            tile_pattern[tpo[b] + i * n_all + j] = int32(1)
             return
         n_tiles = (dim[b] + block_size - int32(1)) / block_size
         tp = tpo[b]

@@ -1095,6 +1095,29 @@ class TestKaminoMetalLanes(unittest.TestCase):
         self.assertGreater(int(results["cpu"].sum()), int(pattern.sum()), "the patterns must fill in")
         np.testing.assert_array_equal(results[str(self.metal)], results["cpu"])
 
+    def test_rcm_symbolic_fill_in_other_block_width_is_conservative(self):
+        """Launched at a block width other than its own, the symbolic fill-in kernel marks the whole
+        lower triangle (a superset of the fill-in) instead of leaving the pattern unfilled."""
+        from newton._src.solvers.kamino._src.linalg.factorize import llt_blocked_rcm_metal  # noqa: PLC0415
+
+        bs, n = 32, 40 * 32
+        t = n // bs
+        rng = np.random.default_rng(5)
+        block = np.zeros((t, t), dtype=np.int32)  # no fill-in at all: only the diagonal is set
+        block[np.triu_indices(t, 1)] = rng.integers(0, 3, t * (t - 1) // 2)
+        dev = self.metal
+        dim = wp.array(np.array([n], dtype=np.int32), device=dev)
+        tpo = wp.array(np.zeros(1, dtype=np.int32), device=dev)
+        tp = wp.array(block.ravel(), device=dev)
+        masks = wp.zeros(llt_blocked_rcm_metal.symbolic_fill_in_words(t), dtype=wp.uint32, device=dev)
+        # A fresh kernel object (block model fixed at its first launch), launched 64 wide.
+        kernel = llt_blocked_rcm_metal._make_symbolic_fill_in_kernel(t, 128)
+        llt_blocked_rcm_metal.launch_symbolic_fill_in(kernel, dim, tpo, bs, tp, masks, 1, dev, width=64)
+        got = tp.numpy().reshape(t, t)
+        want = block.copy()
+        want[np.tril_indices(t)] = np.maximum(want[np.tril_indices(t)], 1)
+        np.testing.assert_array_equal(got, want)
+
     def test_sparse_pgs_wide_block_matches_one_lane(self):
         # One lane first: a kernel object keeps the block model it gets at 256 threads.
         with mock.patch.object(dvi_sparse, "_metal_sparse_inequality_pgs_threads", lambda num_worlds: 1):
