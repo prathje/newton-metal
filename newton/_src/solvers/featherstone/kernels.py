@@ -1696,6 +1696,49 @@ def eval_dense_gemm_batched(
     )
 
 
+@wp.kernel
+def eval_dense_gemm_batched_elementwise(
+    m: wp.array[int],
+    n: wp.array[int],
+    p: wp.array[int],
+    transpose_A: bool,
+    transpose_B: bool,
+    A_start: wp.array[int],
+    B_start: wp.array[int],
+    C_start: wp.array[int],
+    A: wp.array[float],
+    B: wp.array[float],
+    C: wp.array[float],
+):
+    # Metal: :func:`eval_dense_gemm_batched` with one thread per output element
+    # instead of one per articulation (launch dim ``(articulation_count, max m*n)``).
+    # Each element is computed exactly as in ``dense_gemm`` (same products,
+    # same summation order), so the result is bitwise the same.
+    batch, e = wp.tid()
+    rows = m[batch]
+    cols = n[batch]
+    if e >= rows * cols:
+        return
+    i = e // cols
+    j = e - i * cols
+    inner = p[batch]
+    a0 = A_start[batch]
+    b0 = B_start[batch]
+    sum = float(0.0)
+    for k in range(inner):
+        if transpose_A:
+            a_i = k * rows + i
+        else:
+            a_i = i * inner + k
+        if transpose_B:
+            b_j = j * inner + k
+        else:
+            b_j = k * cols + j
+        sum += A[a0 + a_i] * B[b0 + b_j]
+
+    C[C_start[batch] + i * cols + j] = sum
+
+
 @wp.func
 def dense_cholesky(
     n: int,
