@@ -1597,6 +1597,12 @@ class DenseSystemJacobians:
                 self._metal_cts_extent,
                 self._data.J_cts_data,
                 zero=reset_to_zero,
+                limits=(limits.world_active_limits, data.info.limit_cts_group_offset)
+                if limits is not None and limits.model_max_limits_host > 0
+                else None,
+                contacts=(contacts.world_active_contacts, data.info.contact_cts_group_offset)
+                if contacts is not None and contacts.model_max_contacts_host > 0
+                else None,
             )
             if reset_to_zero:
                 self._data.J_dofs_data.zero_()

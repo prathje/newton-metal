@@ -839,6 +839,37 @@ class TestKaminoMetalLanes(unittest.TestCase):
         )
         self.assertEqual(np.count_nonzero(J.numpy()), 0)
 
+    def test_jacobian_partial_zeroing_with_stale_row_counts(self):
+        """The written-row record also covers rows a build writes beyond ``num_total_cts`` (a new
+        detection without ``update_constraints_info``): a later build at fewer rows still equals
+        a build with full zeroing."""
+        from newton._src.solvers.kamino._src.kinematics.constraints import (  # noqa: PLC0415
+            update_constraints_info,
+        )
+
+        test = TestSetup(builder_fn=_padmm_mixed_worlds_builder, max_world_contacts=64, device=self.metal)
+        jac = test.jacobians
+        self.assertIsNotNone(jac._metal_cts_extent)
+        model, data, limits, contacts = test.model, test.data, test.limits, test.contacts
+        self.assertGreater(int(contacts.world_active_contacts.numpy().max()), 0)
+        nrows = data.info.num_total_cts.numpy().copy()
+        joint_rows = model.info.num_joint_bilateral_cts.numpy() + model.info.num_joint_bounded_cts.numpy()
+        self.assertTrue(np.any(joint_rows < nrows))
+        # A build whose row counts lag the detection (joint rows only): contact rows are written beyond.
+        jac._metal_cts_extent.zero_()
+        data.info.num_total_cts.assign(joint_rows.astype(np.int32))
+        jac.build(model, data, limits, contacts)
+        data.info.num_total_cts.assign(nrows)
+        # The next detection finds no contacts (row counts refreshed), then a build.
+        contacts.world_active_contacts.zero_()
+        contacts.model_active_contacts.zero_()
+        update_constraints_info(model=model, data=data)
+        jac.build(model, data, limits, contacts)
+        got = jac.data.J_cts_data.numpy().copy()
+        with mock.patch.object(jac, "_metal_cts_extent", None):
+            jac.build(model, data, limits, contacts)
+        np.testing.assert_array_equal(got, jac.data.J_cts_data.numpy())
+
     def test_partial_zeroing_when_first_used_inside_a_graph_capture(self):
         """The examples capture the very first step. The written-extent record must not be
         allocated inside that capture: its zero fill would then be replayed every step and a
