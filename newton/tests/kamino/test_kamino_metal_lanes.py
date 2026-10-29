@@ -559,6 +559,37 @@ class TestKaminoMetalLanes(unittest.TestCase):
             self.assertFalse(metal_fused.fused_padmm_supported(solver, test.problem))
         self.assertTrue(metal_fused.fused_padmm_supported(solver, test.problem))
 
+    def test_fused_padmm_device_memory_solve_vector_is_bitwise(self):
+        """Worlds with more constraints than the threadgroup solve vector holds run the fused loop on
+        device memory: same arithmetic, bit-identical to the threadgroup path (captured and eager)."""
+        for captured in (False, True):
+            with self.subTest(captured=captured):
+                st_t, lam_t, ncts, *_ = _padmm_solve(
+                    self.metal, fused=True, builder_fn=_padmm_mixed_worlds_builder, captured=captured
+                )
+                self.assertGreater(ncts, 32)
+                # 32: the large world runs on device memory, the small ones in threadgroup memory.
+                with mock.patch.object(metal_fused, "_XCAP_LIMIT", 32):
+                    st_d, lam_d, *_ = _padmm_solve(
+                        self.metal, fused=True, builder_fn=_padmm_mixed_worlds_builder, captured=captured
+                    )
+                np.testing.assert_array_equal(lam_d, lam_t)
+                np.testing.assert_array_equal(st_d, st_t)
+
+    def test_fused_padmm_capacity_beyond_threadgroup_memory(self):
+        """A constraint capacity whose solve vector does not fit threadgroup memory (r10 fell back to
+        the per-kernel loop, e.g. dr_testmech: 12065 rows, 59 used) still runs the fused loop."""
+        test = TestSetup(builder_fn=_padmm_builder, max_world_contacts=4096, device=self.metal)
+        solver = PADMMSolver(
+            model=test.model, config=PADMMSolver.Config(), warmstart=PADMMWarmStartMode.NONE, use_acceleration=True
+        )
+        test.build()
+        ncap = metal_fused._ncap(solver._size.max_of_max_total_cts)
+        tg = metal_fused._tg_for(solver._size.num_worlds, metal_fused.FUSED_TG_SIZE)
+        self.assertGreater(metal_fused._tg_bytes(tg, ncap), metal_fused._max_tg_memory())
+        self.assertLess(metal_fused._xcap(tg, ncap), ncap)
+        self.assertTrue(metal_fused.fused_padmm_supported(solver, test.problem))
+
     def test_wide_llt_solve_matches_reference(self):
         """The threadgroup-wide triangular solves of the fused loop against float64 numpy."""
         rng = np.random.default_rng(3)
@@ -584,6 +615,11 @@ class TestKaminoMetalLanes(unittest.TestCase):
             x = wp.zeros(v, dtype=wp.float32, device=dev)
             metal_fused.launch_wide_llt_solve(len(dims), max(dims), dim, mio_w, vio_w, L, b, x, tg=tg)
             xs = x.numpy()
+            # Blocks larger than the threadgroup solve vector solve on device memory, bit-identically.
+            with mock.patch.object(metal_fused, "_XCAP_LIMIT", 64):
+                x_dev = wp.zeros(v, dtype=wp.float32, device=dev)
+                metal_fused.launch_wide_llt_solve(len(dims), max(dims), dim, mio_w, vio_w, L, b, x_dev, tg=tg)
+            np.testing.assert_array_equal(x_dev.numpy(), xs, err_msg=f"tg={tg}")
             for k, n in enumerate(dims):
                 if n == 0:
                     continue
