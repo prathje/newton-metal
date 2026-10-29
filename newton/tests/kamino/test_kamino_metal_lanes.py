@@ -966,6 +966,46 @@ class TestKaminoMetalLanes(unittest.TestCase):
                 self.assertGreater(np.abs(b).max(), 0.01)
                 np.testing.assert_array_equal(a, b, err_msg=f"capacity_stride={capacity_stride}")
 
+    def test_rcm_symbolic_fill_in_matches_cpu(self):
+        """Threadgroup-parallel symbolic fill-in (Metal) gives the CPU kernel's tile pattern, for
+        patterns with up to 64 tiles (CPU bitset path) and beyond (CPU column scans)."""
+        from newton._src.solvers.kamino._src.linalg.factorize import (  # noqa: PLC0415
+            llt_blocked_rcm,
+            llt_blocked_rcm_metal,
+        )
+
+        rng = np.random.default_rng(9)
+        bs = 32
+        dims = [1, 31, 33, 640, 2048, 3553, 4700, 0, 1000]
+        max_n_tiles = max((d + bs - 1) // bs for d in dims)
+        tiles = [(d + bs - 1) // bs for d in dims]
+        tpo = np.concatenate([[0], np.cumsum([t * t for t in tiles])[:-1]]).astype(np.int32)
+        pattern = np.zeros(sum(t * t for t in tiles), dtype=np.int32)
+        for k, t in enumerate(tiles):
+            block = (rng.random((t, t)) < (0.03 if t > 20 else 0.3)).astype(np.int32)
+            pattern[tpo[k] : tpo[k] + t * t] = block.ravel()
+        results = {}
+        for device in ("cpu", self.metal):
+            dim = wp.array(np.array(dims, dtype=np.int32), device=device)
+            tpo_w = wp.array(tpo, device=device)
+            tp = wp.array(pattern, device=device)
+            if device == "cpu":
+                kernel = llt_blocked_rcm.make_llt_blocked_rcm_symbolic_fill_in_kernel(max_n_tiles)
+                llt_blocked_rcm.llt_blocked_rcm_symbolic_fill_in(kernel, dim, tpo_w, bs, tp, len(dims), device)
+            else:
+                masks = wp.zeros(
+                    len(dims) * llt_blocked_rcm_metal.symbolic_fill_in_words(max_n_tiles),
+                    dtype=wp.uint32,
+                    device=device,
+                )
+                kernel = llt_blocked_rcm_metal.symbolic_fill_in_kernel(max_n_tiles)
+                for _ in range(2):  # stale bitsets from a previous call must not leak
+                    tp.assign(pattern)
+                    llt_blocked_rcm_metal.launch_symbolic_fill_in(kernel, dim, tpo_w, bs, tp, masks, len(dims), device)
+            results[str(device)] = tp.numpy()
+        self.assertGreater(int(results["cpu"].sum()), int(pattern.sum()), "the patterns must fill in")
+        np.testing.assert_array_equal(results[str(self.metal)], results["cpu"])
+
     def test_sparse_pgs_wide_block_matches_one_lane(self):
         # One lane first: a kernel object keeps the block model it gets at 256 threads.
         with mock.patch.object(dvi_sparse, "_metal_sparse_inequality_pgs_threads", lambda num_worlds: 1):

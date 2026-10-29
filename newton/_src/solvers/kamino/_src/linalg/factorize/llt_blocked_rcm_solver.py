@@ -229,6 +229,7 @@ class LLTBlockedRCMSolver(DirectSolver[wp.float32, wp.int32]):
         self._permute_vector_kernel = None
         self._fused_permute_and_tp_kernel = None
         self._symbolic_fill_in_kernel = None
+        self._symbolic_masks = None
 
         # Initialize base class members
         super().__init__(
@@ -362,15 +363,7 @@ class LLTBlockedRCMSolver(DirectSolver[wp.float32, wp.int32]):
                 ],
                 device=self._device,
             )
-        llt_blocked_rcm_symbolic_fill_in(
-            kernel=self._symbolic_fill_in_kernel,
-            dim=info.dim,
-            tpo=self._tpo,
-            block_size=self._block_size,
-            tile_pattern=self._structural_pattern,
-            num_blocks=info.num_blocks,
-            device=self._device,
-        )
+        self._symbolic_fill_in(self._structural_pattern)
         self._structural_ready.fill_(1)
 
     def _compute_sparse_reuse(self, assemble: Callable) -> None:
@@ -408,6 +401,15 @@ class LLTBlockedRCMSolver(DirectSolver[wp.float32, wp.int32]):
         )
         max_n_tiles = (self._max_dim + self._block_size - 1) // self._block_size
         self._symbolic_fill_in_kernel = make_llt_blocked_rcm_symbolic_fill_in_kernel(max_n_tiles)
+        self._symbolic_masks = None
+        if is_metal(self._device):
+            # One threadgroup per matrix instead of one thread (same pattern; see llt_blocked_rcm_metal).
+            from . import llt_blocked_rcm_metal as _metal  # noqa: PLC0415
+
+            self._symbolic_fill_in_kernel = _metal.symbolic_fill_in_kernel(max_n_tiles)
+            self._symbolic_masks = wp.zeros(
+                info.num_blocks * _metal.symbolic_fill_in_words(max_n_tiles), dtype=wp.uint32, device=self._device
+            )
 
         # Per-block tile-pattern layout: n_tiles_i^2 entries per block.
         # Computed on host once from info.dimensions (a cheap list).
@@ -583,18 +585,37 @@ class LLTBlockedRCMSolver(DirectSolver[wp.float32, wp.int32]):
         )
 
         # 3. Inflate the tile pattern by block symbolic Cholesky fill-in.
+        self._symbolic_fill_in(self._tile_pattern)
+
+        # 4. Numeric factorization with tile-pattern skips.
+        self._factorize_numeric()
+
+    def _symbolic_fill_in(self, tile_pattern: wp.array) -> None:
+        """Inflate ``tile_pattern`` in place by block symbolic Cholesky fill-in."""
+        info = self._operator.info
+        if self._symbolic_masks is not None:
+            from . import llt_blocked_rcm_metal as _metal  # noqa: PLC0415
+
+            _metal.launch_symbolic_fill_in(
+                self._symbolic_fill_in_kernel,
+                info.dim,
+                self._tpo,
+                self._block_size,
+                tile_pattern,
+                self._symbolic_masks,
+                info.num_blocks,
+                self._device,
+            )
+            return
         llt_blocked_rcm_symbolic_fill_in(
             kernel=self._symbolic_fill_in_kernel,
             dim=info.dim,
             tpo=self._tpo,
             block_size=self._block_size,
-            tile_pattern=self._tile_pattern,
-            num_blocks=num_blocks,
+            tile_pattern=tile_pattern,
+            num_blocks=info.num_blocks,
             device=self._device,
         )
-
-        # 4. Numeric factorization with tile-pattern skips.
-        self._factorize_numeric()
 
     def _factorize_numeric(self, clear_skipped: bool = True) -> None:
         info = self._operator.info

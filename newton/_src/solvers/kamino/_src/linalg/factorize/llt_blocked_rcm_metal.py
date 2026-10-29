@@ -369,6 +369,118 @@ def _make_solve_kernels(block_size: int, width: int, forward: bool, backward: bo
 _KERNELS: dict = {}
 
 
+# Threads per matrix of the symbolic fill-in kernel.
+METAL_SYMBOLIC_BLOCK_DIM = 128
+
+
+def _make_symbolic_fill_in_kernel(max_n_tiles: int, width: int):
+    """Block symbolic Cholesky fill-in of ``tile_pattern``, one ``width``-thread threadgroup per
+    matrix: the rule of :func:`.make_llt_blocked_rcm_symbolic_fill_in_kernel` (row bitsets,
+    ``L[i, j]`` filled when rows ``i`` and ``j`` share a column ``k < j``), with the rows of each
+    column step ``j`` processed in parallel and a barrier between steps. The bitsets live in
+    ``masks`` (``num_blocks * max_n_tiles * words`` 32-bit words). Same resulting pattern."""
+    W = max(1, (max_n_tiles + 31) // 32)
+    stride = max_n_tiles * W
+
+    @wp.kernel(module="unique", module_options={"enable_backward": False})
+    def llt_blocked_rcm_symbolic_fill_in_metal(
+        dim: wp.array[int32],
+        tpo: wp.array[int32],
+        block_size: int,
+        tile_pattern: wp.array[int32],
+        masks: wp.array[wp.uint32],
+    ):
+        b, lane = wp.tid()
+        block = int32(wp.block_dim())
+        nthreads = int32(width)
+        if block == int32(1):
+            # Serial block model (Warp's Metal wide blocks disabled): lane 0 works alone.
+            if lane != int32(0):
+                return
+            nthreads = int32(1)
+        elif block != int32(width):
+            return
+        n_tiles = (dim[b] + block_size - int32(1)) / block_size
+        tp = tpo[b]
+        mb = b * int32(stride)
+
+        # Diagonal tiles are nonzero; row bitsets of the lower triangle (diagonal included).
+        i = lane
+        while i < n_tiles:
+            tile_pattern[tp + i * n_tiles + i] = int32(1)
+            for w in range(W):
+                m = wp.uint32(0)
+                for bit in range(32):
+                    k = int32(w * 32 + bit)
+                    if k <= i:
+                        if tile_pattern[tp + i * n_tiles + k] != int32(0):
+                            m = m | (wp.uint32(1) << wp.uint32(bit))
+                masks[mb + i * int32(W) + int32(w)] = m
+            i += nthreads
+        _sync_threads()
+
+        # Column steps in order: row i > j gets bit j when it shares a set bit with row j
+        # (row j holds bits <= j only, all final by now).
+        for j in range(n_tiles):
+            i = j + int32(1) + lane
+            while i < n_tiles:
+                hit = int32(0)
+                for w in range(W):
+                    if (masks[mb + i * int32(W) + int32(w)] & masks[mb + j * int32(W) + int32(w)]) != wp.uint32(0):
+                        hit = int32(1)
+                if hit != int32(0):
+                    wj = mb + i * int32(W) + j / int32(32)
+                    masks[wj] = masks[wj] | (wp.uint32(1) << wp.uint32(j % int32(32)))
+                i += nthreads
+            _sync_threads()
+
+        # Write the filled lower triangle back.
+        i = lane
+        while i < n_tiles:
+            for j in range(i):
+                if (masks[mb + i * int32(W) + j / int32(32)] & (wp.uint32(1) << wp.uint32(j % int32(32)))) != wp.uint32(
+                    0
+                ):
+                    if tile_pattern[tp + i * n_tiles + j] == int32(0):
+                        tile_pattern[tp + i * n_tiles + j] = int32(1)
+            i += nthreads
+
+    return llt_blocked_rcm_symbolic_fill_in_metal
+
+
+def symbolic_fill_in_kernel(max_n_tiles: int, width: int = METAL_SYMBOLIC_BLOCK_DIM):
+    """Metal replacement for :func:`.make_llt_blocked_rcm_symbolic_fill_in_kernel`."""
+    key = ("symbolic", max_n_tiles, width)
+    if key not in _KERNELS:
+        _KERNELS[key] = _make_symbolic_fill_in_kernel(max_n_tiles, width)
+    return _KERNELS[key]
+
+
+def symbolic_fill_in_words(max_n_tiles: int) -> int:
+    """32-bit bitset words per matrix needed by :func:`symbolic_fill_in_kernel`."""
+    return max_n_tiles * max(1, (max_n_tiles + 31) // 32)
+
+
+def launch_symbolic_fill_in(
+    kernel,
+    dim,
+    tpo,
+    block_size: int,
+    tile_pattern,
+    masks,
+    num_blocks: int,
+    device,
+    width: int = METAL_SYMBOLIC_BLOCK_DIM,
+):
+    wp.launch_tiled(
+        kernel=kernel,
+        dim=num_blocks,
+        inputs=[dim, tpo, int(block_size), tile_pattern, masks],
+        block_dim=width,
+        device=device,
+    )
+
+
 def factorize_kernel(block_size: int, width: int):
     """Metal replacement for :func:`.make_llt_blocked_rcm_factorize_kernel` at one
     block width (one kernel object per width: Warp fixes a kernel's block model at
