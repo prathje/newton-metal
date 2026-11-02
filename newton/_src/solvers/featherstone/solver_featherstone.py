@@ -10,6 +10,7 @@ from ...core.types import override
 from ...exceptions import NewtonDeprecationWarning
 from ...sim import BodyFlags, Contacts, Control, JointType, Model, ModelFlags, State
 from ...sim.joint_mimic import eval_joint_mimic, has_supported_joint_mimics
+from ...utils.device import is_metal
 from ..coupled.interface import CouplingInterface
 from ..semi_implicit import kernels_contact, kernels_muscle, kernels_particle
 from ..semi_implicit.kernels_contact import (
@@ -42,6 +43,7 @@ from .kernels import (
     create_inertia_matrix_kernel,
     eval_dense_cholesky_batched,
     eval_dense_gemm_batched,
+    eval_dense_gemm_batched_elementwise,
     eval_dense_solve_batched,
     eval_fk_with_velocity_conversion,
     eval_fk_with_velocity_conversion_from_joint_starts,
@@ -397,6 +399,11 @@ class SolverFeatherstone(SolverBase, CouplingInterface):
                 size: wp.array(arts, dtype=wp.int32, device=model.device) for size, arts in group_to_art.items()
             }
 
+            # Largest output (m*n) of the two dense gemms, for the per-element
+            # Metal launch (see ``_launch_dense_gemm``).
+            self._gemm_P_max = int((6 * joint_count * dof_count).max(initial=0))
+            self._gemm_H_max = int((dof_count * dof_count).max(initial=0))
+
             self.articulation_M_rows = wp.array(6 * joint_count, dtype=wp.int32, device=model.device)
             self.articulation_H_rows = wp.array(dof_count, dtype=wp.int32, device=model.device)
             self.articulation_J_rows = wp.array(6 * joint_count, dtype=wp.int32, device=model.device)
@@ -405,6 +412,28 @@ class SolverFeatherstone(SolverBase, CouplingInterface):
             self.articulation_dof_start = wp.array(dof_start, dtype=wp.int32, device=model.device)
             self.articulation_coord_start = wp.array(
                 joint_q_start[articulation_start], dtype=wp.int32, device=model.device
+            )
+
+    def _launch_dense_gemm(self, model, max_mn, inputs, outputs):
+        # Metal: one thread per articulation runs the whole gemm serially, which
+        # dominates the step (e.g. 15 ms of 16 for one humanoid); the per-element
+        # kernel computes the same values. Only without gradients, so the
+        # reverse pass (atomic accumulation order) stays the serial kernel's.
+        if is_metal(model.device) and not model.requires_grad:
+            wp.launch(
+                eval_dense_gemm_batched_elementwise,
+                dim=(model.articulation_count, max_mn),
+                inputs=inputs,
+                outputs=outputs,
+                device=model.device,
+            )
+        else:
+            wp.launch(
+                eval_dense_gemm_batched,
+                dim=model.articulation_count,
+                inputs=inputs,
+                outputs=outputs,
+                device=model.device,
             )
 
     def _allocate_model_aux_vars(self, model):
@@ -923,9 +952,9 @@ class SolverFeatherstone(SolverBase, CouplingInterface):
 
                         else:
                             # form P = M*J
-                            wp.launch(
-                                eval_dense_gemm_batched,
-                                dim=model.articulation_count,
+                            self._launch_dense_gemm(
+                                model,
+                                self._gemm_P_max,
                                 inputs=[
                                     self.articulation_M_rows,
                                     self.articulation_J_cols,
@@ -940,13 +969,12 @@ class SolverFeatherstone(SolverBase, CouplingInterface):
                                     self.J,
                                 ],
                                 outputs=[self.P],
-                                device=model.device,
                             )
 
                             # form H = J^T*P
-                            wp.launch(
-                                eval_dense_gemm_batched,
-                                dim=model.articulation_count,
+                            self._launch_dense_gemm(
+                                model,
+                                self._gemm_H_max,
                                 inputs=[
                                     self.articulation_J_cols,
                                     self.articulation_J_cols,
@@ -962,7 +990,6 @@ class SolverFeatherstone(SolverBase, CouplingInterface):
                                     self.P,
                                 ],
                                 outputs=[self.H],
-                                device=model.device,
                             )
 
                         if not (self.use_tile_gemm and self.fuse_cholesky and not self._has_joint_mimics):
